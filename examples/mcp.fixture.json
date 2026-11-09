@@ -1,0 +1,14 @@
+{
+  "servers": [
+    {
+      "name": "fixture",
+      "command": "node",
+      "args": ["fixtures/mcp-echo.mjs"],
+      "env": {
+        "DEMO_TOKEN": "${secret:demo}"
+      },
+      "enabled": true,
+      "bots": []
+    }
+  ]
+}

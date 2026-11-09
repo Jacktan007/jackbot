@@ -1,0 +1,258 @@
+import { act, render, screen } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
+import { describe, expect, it, vi } from 'vitest'
+import type { ComputerInfo } from '../types'
+import { ComputerPanel } from './ComputerPanel'
+
+const SCREEN = 'http://127.0.0.1:53314/vnc.html?autoconnect=1&resize=scale&reconnect=1&password=pw12345x'
+const running: ComputerInfo = {
+  botId: 'researcher',
+  running: true,
+  vncUrl: SCREEN,
+  routines: [{ id: 1, name: 'Morning digest', cron: '0 9 * * *', human: 'every day at 09:00', last_run_at: null, enabled: 1 }],
+  usage: { today: { prompt: 12000, completion: 345, cached: 8000, total: 12345 }, budget: 200000 },
+}
+
+describe('ComputerPanel', () => {
+  it('embeds the live screen and lists what is scheduled', () => {
+    const { container } = render(<ComputerPanel info={running} botName="Scout" onClose={() => {}} />)
+    const frame = container.querySelector('iframe')!
+    expect(frame.getAttribute('src')).toBe(SCREEN) // 网关给的地址已带好连接参数
+    expect(screen.getByText("Scout's computer")).toBeInTheDocument()
+    expect(screen.getByText('Morning digest')).toBeInTheDocument()
+    expect(screen.getByText('every day at 09:00')).toBeInTheDocument()
+  })
+
+  it('explains why there is no screen instead of showing a blank frame', () => {
+    const { container } = render(
+      <ComputerPanel
+        info={{ ...running, running: false, vncUrl: null, error: 'docker daemon not running' }}
+        botName="Scout"
+        onClose={() => {}}
+      />,
+    )
+    expect(container.querySelector('iframe')).toBeNull()
+    expect(screen.getByText(/docker daemon not running/)).toBeInTheDocument()
+  })
+
+  it('says so when nothing is scheduled', () => {
+    render(<ComputerPanel info={{ ...running, routines: [] }} botName="Scout" onClose={() => {}} />)
+    expect(screen.getByText('No routines yet.')).toBeInTheDocument()
+  })
+
+  it('reminds the operator that passwords never go through chat', () => {
+    render(<ComputerPanel info={running} botName="Scout" onClose={() => {}} />)
+    expect(screen.getByText(/never hand it a password in chat/i)).toBeInTheDocument()
+  })
+
+  it('closes', async () => {
+    const onClose = vi.fn()
+    render(<ComputerPanel info={running} botName="Scout" onClose={onClose} />)
+    await userEvent.click(screen.getByRole('button', { name: 'Close' }))
+    expect(onClose).toHaveBeenCalled()
+  })
+
+  it('runs, pauses, resumes and deletes routines', async () => {
+    const onRoutine = vi.fn()
+    const paused = { ...running.routines[0]!, id: 2, name: 'Old sweep', enabled: 0 }
+    render(<ComputerPanel info={{ ...running, routines: [running.routines[0]!, paused] }} botName="Scout" onClose={() => {}} onRoutine={onRoutine} />)
+    await userEvent.click(screen.getByRole('button', { name: 'Run Morning digest now' }))
+    await userEvent.click(screen.getByRole('button', { name: 'Pause Morning digest' }))
+    await userEvent.click(screen.getByRole('button', { name: 'Resume Old sweep' }))
+    await userEvent.click(screen.getByRole('button', { name: 'Delete Old sweep' }))
+    expect(onRoutine.mock.calls).toEqual([[1, 'run'], [1, 'pause'], [2, 'resume'], [2, 'delete']])
+    expect(screen.getByText('paused')).toBeInTheDocument()
+  })
+
+  it('opens straight away while the computer is still waking, and shows how long it has waited', () => {
+    vi.useFakeTimers()
+    try {
+      const { container } = render(<ComputerPanel info={null} botName="Scout" onClose={() => {}} />)
+      expect(screen.getByRole('status')).toHaveTextContent("Starting Scout's computer…")
+      expect(container.querySelector('iframe')).toBeNull()
+      expect(screen.queryByText('Routines')).toBeNull()
+      expect(screen.queryByText(/\ds$/)).toBeNull() // 头两秒不跳数字
+      act(() => { vi.advanceTimersByTime(4_000) })
+      expect(screen.getByText('4s')).toBeInTheDocument()
+      expect(screen.getByText(/never hand it a password in chat/i)).toBeInTheDocument()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('shows today\'s token use against the budget', () => {
+    render(<ComputerPanel info={running} botName="Scout" onClose={() => {}} />)
+    expect(screen.getByText(/12,345/)).toBeInTheDocument()
+    expect(screen.getByText(/200,000/)).toBeInTheDocument()
+  })
+
+  it('lists what goes out without asking, and revokes it', async () => {
+    const onRevokeRule = vi.fn()
+    render(<ComputerPanel
+      info={{ ...running, rules: [{ id: 4, kind: 'email', target: 'bob@acme.com', expiresAt: null, createdAt: 1 }] }}
+      botName="Scout"
+      onClose={() => {}}
+      onRevokeRule={onRevokeRule}
+    />)
+    expect(screen.getByText('email → bob@acme.com')).toBeInTheDocument()
+    await userEvent.click(screen.getByRole('button', { name: 'Stop allowing email to bob@acme.com' }))
+    expect(onRevokeRule).toHaveBeenCalledWith(4)
+  })
+
+  it('says nothing goes out unasked when there are no rules', () => {
+    render(<ComputerPanel info={running} botName="Scout" onClose={() => {}} />)
+    expect(screen.getByText('Nothing goes out without your approval.')).toBeInTheDocument()
+  })
+
+  it('lists standing rules and forgets one by its exact text', async () => {
+    const onForgetRule = vi.fn()
+    render(<ComputerPanel info={{ ...running, memory: ['Never email Globex on Fridays.'] }} botName="Scout" onClose={() => {}} onForgetRule={onForgetRule} />)
+    await userEvent.click(screen.getByRole('button', { name: 'Forget: Never email Globex on Fridays.' }))
+    expect(onForgetRule).toHaveBeenCalledWith('Never email Globex on Fridays.')
+  })
+
+  it('copies the full webhook address only for routines that have one', async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined)
+    Object.defineProperty(navigator, 'clipboard', { value: { writeText }, configurable: true })
+    const hooked = { id: 2, name: 'Triage', cron: '', human: 'when its webhook is called', last_run_at: null, enabled: 1, webhook_path: '/hooks/routines/2?key=k3y' }
+    render(<ComputerPanel info={{ ...running, routines: [...running.routines, hooked] }} botName="Scout" onClose={() => {}} />)
+    expect(screen.getAllByRole('button', { name: /Copy the webhook address/ })).toHaveLength(1)
+    await userEvent.click(screen.getByRole('button', { name: 'Copy the webhook address of Triage' }))
+    expect(writeText).toHaveBeenCalledWith(`${location.origin}/hooks/routines/2?key=k3y`)
+    expect(screen.getByText('Copied')).toBeInTheDocument()
+  })
+
+  it('copies GitHub settings with the key as the secret and no key in the address', async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined)
+    Object.defineProperty(navigator, 'clipboard', { value: { writeText }, configurable: true })
+    const hooked = {
+      id: 2, name: 'Triage', cron: '', human: 'when its webhook is called', last_run_at: null, enabled: 1,
+      webhook_path: '/hooks/routines/2?key=k3y', webhook_secret: 'k3y',
+    }
+    render(<ComputerPanel info={{ ...running, routines: [hooked] }} botName="Scout" onClose={() => {}} />)
+    await userEvent.click(screen.getByRole('button', { name: 'Copy the GitHub webhook settings of Triage' }))
+    expect(writeText).toHaveBeenCalledWith(
+      `Payload URL: ${location.origin}/hooks/routines/2\nContent type: application/json\nSecret: k3y`,
+    )
+  })
+
+  it('marks a rule that no longer applies instead of showing it as live', () => {
+    const { container } = render(
+      <ComputerPanel
+        info={{ ...running, rules: [{ id: 5, kind: 'email', target: '*', expiresAt: null, createdAt: 1, applies: false, whyNot: '"*" is a wildcard, not one destination' }] }}
+        botName="Scout"
+        onClose={() => {}}
+      />,
+    )
+    expect(screen.getByText('No longer applies: "*" is a wildcard, not one destination')).toBeInTheDocument()
+    expect(container.querySelector('.panel-rule.inert')).not.toBeNull()
+  })
+
+  it('marks watch routines, lists shared skills and the recent actions', () => {
+    const watch = { ...running.routines[0]!, id: 3, name: 'Status watch', human: 'every 30 minutes', mode: 'watch' as const }
+    render(<ComputerPanel
+      info={{
+        ...running,
+        routines: [watch],
+        skills: [{ name: 'weekly-report', description: 'How the Friday report is laid out' }],
+        actions: [
+          { id: 2, thread_id: 'dm:researcher', trigger: 'webhook', tool: 'browser_goto', summary: 'status.example.com', ok: false, ms: 900, created_at: Date.now() },
+          { id: 1, thread_id: 'dm:researcher', trigger: 'you', tool: 'approval', summary: 'approved by you: send it', ok: null, ms: null, created_at: Date.now() },
+        ],
+      }}
+      botName="Scout"
+      onClose={() => {}}
+    />)
+    expect(screen.getByText('watch')).toBeInTheDocument()
+    expect(screen.getByText('weekly-report')).toBeInTheDocument()
+    expect(screen.getByText('How the Friday report is laid out')).toBeInTheDocument()
+    expect(screen.getByText('status.example.com').closest('li')).toHaveClass('failed')
+    expect(screen.getByText(/· webhook$/)).toBeInTheDocument()
+    expect(screen.getByText('approved by you: send it')).toBeInTheDocument()
+  })
+
+  it('says the log is empty instead of hiding it', () => {
+    render(<ComputerPanel info={{ ...running, actions: [] }} botName="Scout" onClose={() => {}} />)
+    expect(screen.getByText('Nothing yet. Every step it takes is logged here.')).toBeInTheDocument()
+  })
+})
+
+describe('a local computer', () => {
+  const local: ComputerInfo = {
+    ...running, kind: 'local', vncUrl: null, screen: { kind: 'cdp', url: '/screen/researcher/ws' },
+  }
+
+  it('shows the screencast view and says what kind of computer it is', () => {
+    const sockets: string[] = []
+    vi.stubGlobal('WebSocket', class { constructor(url: string) { sockets.push(url) } close() {} })
+    const { container } = render(<ComputerPanel info={local} botName="Scout" onClose={() => {}} />)
+    expect(container.querySelector('iframe')).toBeNull()
+    expect(container.querySelector('.panel-screen-cdp')).not.toBeNull()
+    expect(screen.getByRole('status')).toHaveTextContent('Connecting…')
+    expect(sockets[0]).toMatch(/\/screen\/researcher\/ws$/)
+    expect(screen.getByText(/Local computer/)).toBeInTheDocument()
+    vi.unstubAllGlobals()
+  })
+
+  it('tells the operator the browser window is open for signing in, and reports when they are done', async () => {
+    vi.stubGlobal('WebSocket', class { close() {} })
+    const done = vi.fn()
+    render(<ComputerPanel info={{ ...local, window: true }} botName="Scout" onClose={() => {}} onWindowDone={done} />)
+    expect(screen.getByText(/open as a window on your desktop/)).toBeInTheDocument()
+    await userEvent.click(screen.getByRole('button', { name: "I\u2019m done signing in" }))
+    expect(done).toHaveBeenCalledTimes(1)
+    vi.unstubAllGlobals()
+  })
+})
+
+describe('the commands switch', () => {
+  const local: ComputerInfo = { ...running, kind: 'local', vncUrl: null, screen: null }
+
+  it('turns commands on and off for a local computer', async () => {
+    const onShell = vi.fn()
+    render(<ComputerPanel info={{ ...local, shell: { enabled: false, available: true } }} botName="Scout" onClose={() => {}} onShell={onShell} />)
+    const box = screen.getByRole('checkbox', { name: 'Allow commands' })
+    expect(box).not.toBeChecked()
+    await userEvent.click(box)
+    expect(onShell).toHaveBeenCalledWith(true)
+  })
+
+  it('explains when no sandbox is available, and keeps the switch off', () => {
+    render(<ComputerPanel info={{ ...local, shell: { enabled: false, available: false, why: 'Install bubblewrap.' } }} botName="Scout" onClose={() => {}} onShell={() => {}} />)
+    expect(screen.getByRole('checkbox', { name: 'Allow commands' })).toBeDisabled()
+    expect(screen.getByText(/Install bubblewrap/)).toBeInTheDocument()
+  })
+
+  it('is not offered for a sealed computer', () => {
+    render(<ComputerPanel info={{ ...running, kind: 'docker', shell: { enabled: true, available: true } }} botName="Scout" onClose={() => {}} onShell={() => {}} />)
+    expect(screen.queryByRole('checkbox', { name: 'Allow commands' })).toBeNull()
+  })
+})
+
+describe('waiting on the gateway', () => {
+  const local: ComputerInfo = { ...running, kind: 'local', vncUrl: null, screen: null, shell: { enabled: false, available: true } }
+
+  it('locks the commands switch while the sandbox is checked, and shows why when the gateway refuses', async () => {
+    let reject!: (err: Error) => void
+    const onShell = vi.fn(() => new Promise<void>((_, r) => { reject = r }))
+    render(<ComputerPanel info={local} botName="Scout" onClose={() => {}} onShell={onShell} />)
+    const box = screen.getByRole('checkbox', { name: 'Allow commands' })
+    await userEvent.click(box)
+    expect(onShell).toHaveBeenCalledWith(true)
+    expect(box).toBeDisabled()
+    expect(screen.getByText(/Checking the sandbox/)).toBeInTheDocument()
+    await act(async () => { reject(new Error('the sandbox failed its self-check: it let a command write outside')) })
+    expect(screen.getByRole('alert')).toHaveTextContent(/write outside/)
+    expect(box).not.toBeDisabled()
+  })
+
+  it('disables the done button while the window is being put away', async () => {
+    let resolve!: () => void
+    const onWindowDone = vi.fn(() => new Promise<void>((r) => { resolve = r }))
+    render(<ComputerPanel info={{ ...local, window: true }} botName="Scout" onClose={() => {}} onWindowDone={onWindowDone} />)
+    await userEvent.click(screen.getByRole('button', { name: "I\u2019m done signing in" }))
+    expect(screen.getByRole('button', { name: 'Closing…' })).toBeDisabled()
+    await act(async () => { resolve() })
+    expect(screen.getByRole('button', { name: "I\u2019m done signing in" })).not.toBeDisabled()
+  })
+})

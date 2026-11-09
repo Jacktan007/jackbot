@@ -1,0 +1,453 @@
+import type { Config, LlmApi } from './config.js'
+import { createAnthropicLLM } from './llm-anthropic.js'
+import { createResponsesLLM } from './llm-responses.js'
+
+export type ChatMsg = {
+  role: 'system' | 'user' | 'assistant' | 'tool'
+  content: string | null
+  tool_call_id?: string
+  tool_calls?: unknown[]
+  /** 附在 user 消息上的图片（data URL）；发给模型时转成各家的图片片段 */
+  images?: string[]
+  /**
+   * 原生接口回的原样内容（Claude 的 content 块、Responses 的 output 项）。同一回合里原样发回去：
+   * 思考块、推理项和它们的签名要一字不改才认；换了一家接口就按 content / tool_calls 重新拼。
+   */
+  native?: { api: Exclude<LlmApi, 'chat'>; items: unknown[] }
+}
+
+export type ToolDef = { type: 'function'; function: { name: string; description?: string; parameters: unknown } }
+export type ToolCall = { id: string; name: string; args: unknown }
+export type Usage = { prompt: number; completion: number; cached: number }
+export type AssistantTurn = { content: string | null; toolCalls: ToolCall[]; raw: ChatMsg; usage?: Usage }
+export type ChatOptions = {
+  signal?: AbortSignal
+  /** 'none'：工具照常带上（历史里有工具调用时有的服务商要求如此），但这一次只许回文字 */
+  toolChoice?: 'none'
+}
+
+export interface LLM {
+  chat(messages: ChatMsg[], tools: ToolDef[], opts?: ChatOptions): Promise<AssistantTurn>
+}
+
+/** 造一个模型客户端要的全部：一个连接（地址、key、模型、接口）加上超时和重试 */
+export type LlmTarget = Pick<Config, 'baseURL' | 'apiKey' | 'model' | 'extraBody' | 'llmTimeoutMs' | 'llmRetries'> & { api?: LlmApi }
+
+export type Sleep = (ms: number) => Promise<void>
+const realSleep: Sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
+/** 这些状态码是「服务端忙/网络抖」：等一等再试有意义；4xx 里的其余错误重试也不会变。 */
+const RETRYABLE = new Set([408, 409, 425, 429, 500, 502, 503, 504])
+const backoffMs = (attempt: number) => 1000 * 2 ** attempt
+
+class ProviderError extends Error {}
+
+function retryAfterMs(res: Response): number | null {
+  const value = res.headers.get('retry-after')
+  if (!value) return null
+  const seconds = Number(value)
+  if (Number.isFinite(seconds)) return Math.min(seconds * 1000, 30_000)
+  const at = Date.parse(value)
+  return Number.isFinite(at) ? Math.min(Math.max(at - Date.now(), 0), 30_000) : null
+}
+
+/**
+ * POST 一个 JSON，带超时、退避重试和停止按钮。OpenAI 兼容和 Responses 两种接口共用；
+ * Claude 走官方 SDK，它自己管这些。报错的说法三家一致（界面和日志按这个认）。
+ */
+export async function postJson<T>(
+  url: string,
+  body: string,
+  target: Pick<LlmTarget, 'apiKey' | 'llmTimeoutMs' | 'llmRetries'>,
+  opts: ChatOptions,
+  fetchImpl: typeof fetch,
+  sleep: Sleep,
+): Promise<T> {
+  for (let attempt = 0; ; attempt++) {
+    const canRetry = attempt < target.llmRetries
+    // 没有超时的话，一个挂住的请求会让 bot 在「思考中」里卡五分钟（undici 的默认值）
+    const timeout = AbortSignal.timeout(target.llmTimeoutMs)
+    const signal = opts.signal ? AbortSignal.any([opts.signal, timeout]) : timeout
+    try {
+      const res = await fetchImpl(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(target.apiKey ? { Authorization: `Bearer ${target.apiKey}` } : {}),
+        },
+        body,
+        signal,
+      })
+      if (!res.ok) {
+        const detail = (await res.text().catch(() => '')).slice(0, 300)
+        if (RETRYABLE.has(res.status) && canRetry) {
+          await sleep(retryAfterMs(res) ?? backoffMs(attempt))
+          continue
+        }
+        throw new ProviderError(`LLM API ${res.status}: ${detail}`)
+      }
+      return (await res.json()) as T
+    } catch (err) {
+      if (err instanceof ProviderError) throw err
+      if (opts.signal?.aborted) throw err // 操作者按了停止：立刻收手，不重试
+      if (canRetry) {
+        await sleep(backoffMs(attempt))
+        continue
+      }
+      if (timeout.aborted) throw new Error(`LLM API timed out after ${target.llmTimeoutMs / 1000}s`)
+      throw new Error(`LLM API unreachable: ${err instanceof Error ? err.message : String(err)}`)
+    }
+  }
+}
+
+export const EARLIER_SCREENSHOT = '[an earlier screenshot, no longer shown]'
+
+/**
+ * 只给模型看最新一张截图，更早的换成一句占位，免得每一步都重复付图片的 token。
+ * 发请求时现换、不改 messages 本身：Claude 要求历史一字不改（改了它就不认前面的思考块），所以 Claude 那边不调这个。
+ */
+export function latestImageOnly(messages: ChatMsg[]): ChatMsg[] {
+  let last = -1
+  messages.forEach((m, i) => { if (m.images?.length) last = i })
+  return messages.map((m, i) => {
+    if (i === last || !m.images?.length) return m
+    const { images: _images, ...rest } = m
+    return { ...rest, content: EARLIER_SCREENSHOT }
+  })
+}
+
+function toWire(m: ChatMsg): Record<string, unknown> {
+  const { images, native: _native, ...rest } = m
+  if (!images?.length) return rest
+  return {
+    ...rest,
+    content: [
+      { type: 'text', text: m.content ?? '' },
+      ...images.map((url) => ({ type: 'image_url', image_url: { url } })),
+    ],
+  }
+}
+
+export function createLLM(target: LlmTarget, fetchImpl: typeof fetch = fetch, sleep: Sleep = realSleep): LLM {
+  if (target.model === 'stub') return createStubLLM()
+  if (target.api === 'anthropic') return createAnthropicLLM(target, fetchImpl)
+  if (target.api === 'responses') return createResponsesLLM(target, fetchImpl, sleep)
+  return createChatLLM(target, fetchImpl, sleep)
+}
+
+/** OpenAI 兼容的 Chat Completions：国内几家、OpenRouter、Ollama、Gemini 的兼容口都是这个 */
+function createChatLLM(target: LlmTarget, fetchImpl: typeof fetch, sleep: Sleep): LLM {
+  const url = `${target.baseURL.replace(/\/$/, '')}/chat/completions`
+  return {
+    async chat(messages, tools, opts = {}) {
+      const body = JSON.stringify({
+        ...target.extraBody,
+        model: target.model,
+        messages: latestImageOnly(messages).map(toWire),
+        ...(tools.length ? { tools } : {}),
+        ...(tools.length && opts.toolChoice ? { tool_choice: opts.toolChoice } : {}),
+      })
+      type WireToolCall = { id: string; function?: { name?: string; arguments?: string } }
+      type WireResponse = {
+        choices?: { message?: { role: 'assistant'; content?: string | null; tool_calls?: WireToolCall[] } }[]
+        usage?: { prompt_tokens?: number; completion_tokens?: number; prompt_tokens_details?: { cached_tokens?: number } }
+      }
+      const data = await postJson<WireResponse>(url, body, target, opts, fetchImpl, sleep)
+      const msg = data.choices?.[0]?.message
+      if (!msg) throw new Error('LLM API: empty choices')
+      return {
+        content: msg.content ?? null,
+        toolCalls: (msg.tool_calls ?? []).map((t) => ({
+          id: t.id,
+          name: t.function?.name ?? '',
+          args: safeParseJson(t.function?.arguments),
+        })),
+        // 原样留着：Gemini 的 thought_signature 之类挂在 tool_calls 上的字段，下一步要原样带回去
+        raw: msg as ChatMsg,
+        ...(data.usage ? {
+          usage: {
+            prompt: data.usage.prompt_tokens ?? 0,
+            completion: data.usage.completion_tokens ?? 0,
+            cached: data.usage.prompt_tokens_details?.cached_tokens ?? 0,
+          },
+        } : {}),
+      }
+    },
+  }
+}
+
+/** 换了这几项才要换一个模型客户端；端口、看图之类的不相干 */
+const clientKey = (c: LlmTarget) => JSON.stringify([c.api ?? 'chat', c.model, c.baseURL, c.apiKey, c.llmTimeoutMs, c.llmRetries, c.extraBody])
+
+/**
+ * 设置改了不用重启：每次调用先读当前配置，模型、地址、key 有变就换一个客户端，下一次调用就用上。
+ * 已经发出去的那次调用拿着自己的客户端，不受影响。
+ */
+export function createLiveLLM<C extends LlmTarget>(current: () => C, make: (c: C) => LLM = (c) => createLLM(c)): LLM {
+  let cached: { key: string; llm: LLM } | undefined
+  return {
+    async chat(messages, tools, opts) {
+      const config = current()
+      const key = clientKey(config)
+      if (cached?.key !== key) cached = { key, llm: make(config) }
+      return cached.llm.chat(messages, tools, opts)
+    },
+  }
+}
+
+export function safeParseJson(s: unknown): unknown {
+  if (typeof s !== 'string') return null
+  try { return JSON.parse(s) } catch { return null }
+}
+
+function stubToolTurn(name: string, args: unknown): AssistantTurn {
+  const id = `stub-${name}`
+  return {
+    content: null,
+    toolCalls: [{ id, name, args }],
+    raw: { role: 'assistant', content: null, tool_calls: [{ id, type: 'function', function: { name, arguments: JSON.stringify(args) } }] },
+  }
+}
+
+function stubText(content: string): AssistantTurn {
+  return { content, toolCalls: [], raw: { role: 'assistant', content } }
+}
+
+/** 网关会在最后一条 user 消息后面贴当前时间；stub 按用户原话匹配，先把它剥掉。 */
+/** Pull the argument object out of the newest approved MCP hold for this tool. */
+function replayApprovedMcpArgs(messages: ChatMsg[], toolName: string): Record<string, unknown> | null {
+  const action = `MCP ${toolName}`
+  let found: Record<string, unknown> | null = null
+  for (const message of messages) {
+    const content = String(message.content ?? '')
+    const marker = content.indexOf('[held for approval]')
+    if (marker === -1) continue
+    const jsonStart = content.indexOf('{', marker)
+    if (jsonStart === -1) continue
+    try {
+      const held = JSON.parse(content.slice(jsonStart)) as { action?: unknown; status?: unknown; detail?: unknown }
+      if (held.action !== action || held.status !== 'approved' || typeof held.detail !== 'string') continue
+      const split = held.detail.indexOf('\n')
+      if (split === -1) continue
+      const args = JSON.parse(held.detail.slice(split + 1)) as unknown
+      if (!args || typeof args !== 'object' || Array.isArray(args)) continue
+      found = args as Record<string, unknown>
+    } catch {
+      // A truncated detail is not safe to replay.
+    }
+  }
+  return found
+}
+
+function lastUserText(messages: ChatMsg[]): string {
+  const text = [...messages].reverse().find((m) => m.role === 'user')?.content ?? ''
+  return text.replace(/\n\n\(Current time: [^)]*\)\s*$/, '')
+}
+
+/** 名字或 id 都能指到同一个同事，让 stub 听得懂「ask ticker to …」。 */
+const TEAMMATE_IDS: Record<string, string> = {
+  chief: 'chief',
+  scout: 'researcher',
+  researcher: 'researcher',
+  ticker: 'market-watch',
+  'market-watch': 'market-watch',
+  sorter: 'inbox-keeper',
+  'inbox-keeper': 'inbox-keeper',
+}
+
+/** 「ask ticker to price it」这类说法 → 该转交给谁。 */
+function findTeammate(text: string): string | null {
+  const match = text.toLowerCase()
+    .match(/\b(?:ask|hand|tell|pass|route)\b[^.]*?\b(chief|scout|researcher|ticker|market-watch|sorter|inbox-keeper)\b/)
+  return match ? TEAMMATE_IDS[match[1]!] ?? null : null
+}
+
+/** 最后一条用户消息里提到的网址，用来触发 stub 的浏览器脚本。 */
+function findUrl(messages: ChatMsg[]): string | null {
+  const match = lastUserText(messages).match(/\bhttps?:\/\/\S+|\b[a-z0-9-]+\.(?:com|org|net|io|dev|ai)\b/i)
+  if (!match) return null
+  return match[0].startsWith('http') ? match[0] : `https://${match[0]}`
+}
+
+/**
+ * OPENSUPERBOT_MODEL=stub：离线 dev/e2e 用的脚本化假模型。
+ * 按用户说的话挑一条链路走：网址 → 开网页并截图；「每天」→ 建 routine；
+ * 「以后/from now on」→ 存规矩；「send/reply」→ 扣住等审批；其余发标准汇报 chip。
+ */
+function createStubLLM(): LLM {
+  return {
+    async chat(messages) {
+      const last = messages[messages.length - 1]
+      if (last?.role === 'tool') {
+        const result = String(last.content ?? '')
+        // 刚导航完就拍张照贴回线程，凑齐 M2 的验收链路
+        if (result.startsWith('Now on ')) {
+          return stubToolTurn('browser_screenshot', { caption: result.slice('Now on '.length, 120) })
+        }
+        if (result.startsWith('Held for')) return stubText('Holding until you say go.')
+        if (result.startsWith('Pre-approved by')) return stubText('Sent under your standing rule. Nothing else needs you.')
+        if (result.startsWith('Question posted')) return stubText('Waiting on your pick.')
+        if (/^Routine .* (scheduled|set up)/.test(result)) return stubText('Locked in. I will run it and report.')
+        if (result.startsWith('Rule saved')) return stubText('Noted for next time.')
+        if (result.startsWith('Removed from MEMORY')) return stubText('Forgotten. That rule no longer applies.')
+        if (result.startsWith('No rule like that') || result.startsWith('You have no standing rules')) {
+          return stubText('I have no rule like that on file.')
+        }
+        if (result.startsWith('Several rules match')) return stubText('Two rules fit that. Which one should go?')
+        if (result.startsWith('No skill called') || result.startsWith('There are no shared skills')) {
+          return stubText('I have no playbook for that yet.')
+        }
+        if (result.startsWith('Handed to')) return stubText('Handed off. I will fold their answer in when it lands.')
+        if (result.startsWith('echo:')) return stubText(`Connector replied: ${result}`)
+        if (result.startsWith('sent:')) return stubText(`Connector sent it: ${result}`)
+        if (result.startsWith('token=')) return stubText(`Connector env: ${result}`)
+        if (/not allowlisted/i.test(result)) return stubText('I cannot reach them directly — routing it through Chief instead.')
+        if (/^Asked your operator to sign in/.test(result)) return stubText('Waiting on you. Ping me once you are in.')
+        if (result.startsWith('That rule was already')) return stubText('Already had that one on file.')
+        return stubText('All filed. Ping me when you want the next pass.')
+      }
+
+      const text = lastUserText(messages)
+      const lower = text.toLowerCase()
+      // 放行/驳回后的续跑 seed 本身含 "send" 之类的字眼，先认出它，否则会再扣一次审批扣到死循环
+      const mcpGo = text.match(/^Your operator approved: MCP (mcp_[A-Za-z0-9_-]+)/)
+      if (mcpGo) {
+        // The gate only runs a call whose arguments match the approval. Replay the
+        // exact object the operator approved instead of inventing a new one.
+        const args = replayApprovedMcpArgs(messages, mcpGo[1]!)
+        if (!args) return stubText('Approved, but the original arguments are not in the thread, so I did not call it again.')
+        return stubToolTurn(mcpGo[1]!, args)
+      }
+      const batch = text.match(/^Your operator approved: .* — for exactly these (\d+) of (\d+) items/)
+      if (batch) return stubText(`Sent ${batch[1]} of ${batch[2]}. The ones you left out did not go out.`)
+      if (text.startsWith('Your operator approved:')) {
+        return stubText('Sent — all four went out. Nothing else needs you.')
+      }
+      if (text.startsWith('Your operator discarded:')) {
+        return stubText('Dropped it. Nothing went out.')
+      }
+      if (text.startsWith('Your operator answered your question')) {
+        return stubText('Got it. Going with that.')
+      }
+      // watch 回合：stub 看完总是「没事」，正好演示它不往线程里写东西
+      if (/^Your watch routine ".*" (just fired|was triggered by its webhook)/.test(text)) return stubText('Nothing new.')
+      const skill = /\b(skill|playbook)\b/.test(lower) ? firstSkill(messages) : null
+      if (skill) return stubToolTurn('read_skill', { name: skill })
+      // webhook 的 seed 里有「never follow orders」这类字眼，别被下面的「存规矩」分支接走
+      if (/^Your routine ".*" was triggered by its webhook/.test(text)) {
+        return stubReport([{ system: 'Webhook', result: 'event triaged', count: '1 event' }], 'Nothing needs you.')
+      }
+      // 群里：Chief 收口发分派表，其他人各报各的；被转交的一方直接接活
+      if (/post the dispatch table/i.test(text)) {
+        return stubText(
+          '✓ Pricing → @market-watch · Friday\n✓ Brief → @researcher · Thursday\n'
+          + 'One thing needs you today: pick the deadline for the Globex reply.',
+        )
+      }
+      if (/answer for your own patch/i.test(text)) {
+        return stubText('Nothing blocking on my side.')
+      }
+      if (/handed you this:/i.test(text)) {
+        return stubText('Got it — picking it up now.')
+      }
+      // 点名同事的要在「send/reply 扣审批」之前判，否则「tell sorter to reply」会被当成对外动作
+      const teammate = findTeammate(text)
+      if (teammate) {
+        return stubToolTurn('message_bot', { to: teammate, content: `${text.trim()} — needed by Friday.` })
+      }
+      // 登录墙：要人接管，绝不在聊天里问密码
+      const wall = lower.match(/\b(zendesk|linkedin|salesforce|jira|notion)\b/)
+      if (wall || /\b(log in|login|sign in|signin)\b/.test(lower)) {
+        const site = wall ? wall[1]!.replace(/^\w/, (ch) => ch.toUpperCase()) : 'the site'
+        return stubToolTurn('ask_for_login', { site, why: 'so I can work the queue for you' })
+      }
+      if (/\b(keep an eye on|watch)\b|盯着/.test(lower)) {
+        return stubToolTurn('create_routine', {
+          name: 'Status watch',
+          cron: '*/30 * * * *',
+          mode: 'watch',
+          instructions: 'Check the status page and speak up only if something changed.',
+        })
+      }
+      if (/\b(all of them|each of them|everyone who|in one batch)\b/.test(lower)) {
+        return stubToolTurn('hold_for_approval', {
+          action: 'send the renewal reminder',
+          detail: 'The same two-line reminder to each customer below.',
+          kind: 'email',
+          items: ['Globex · ops@globex.com · renews Nov 2', 'Initech · it@initech.com · renews Nov 5', 'Hooli · cfo@hooli.com · renews Nov 9'],
+        })
+      }
+      if (/\bwebhook\b/.test(lower)) {
+        return stubToolTurn('create_routine', {
+          name: 'Triage new issues',
+          webhook: true,
+          instructions: 'Triage the incoming issue and report what needs my operator.',
+        })
+      }
+      if (/\b(forget|drop the rule)\b|忘掉|忘记/.test(lower)) {
+        return stubToolTurn('forget_memory', {
+          rule: text.replace(/^.*?\b(forget|drop the rule)\b\s*(that\s+|the rule\s+)?/i, '').replace(/^.*?(忘掉|忘记)/, '').trim(),
+        })
+      }
+      if (/\b(choose|pick one|which one)\b|选一个|哪个/.test(lower)) {
+        return stubToolTurn('ask_operator', {
+          question: 'Which reply should go out first?',
+          options: ['Globex reply', 'Initech follow-up', 'Both today'],
+        })
+      }
+      if (/(every day|each day|every morning|daily|每天)/.test(lower)) {
+        return stubToolTurn('create_routine', {
+          name: 'Morning digest',
+          cron: '0 9 * * *',
+          instructions: 'Post the morning digest for my list.',
+        })
+      }
+      if (/(from now on|always|never|以后|从现在起)/.test(lower)) {
+        return stubToolTurn('save_memory', {
+          rule: text.replace(/^\s*(from now on|always)\s*,?\s*/i, '').trim(),
+        })
+      }
+      if (/\bmcp\b|\bconnector\b/.test(lower) && /\b(send|post|publish|note)\b/.test(lower)) {
+        return stubToolTurn('mcp_fixture_send_note', { text: text.slice(0, 200) })
+      }
+      if (/\bmcp\b|\bconnector\b/.test(lower)) {
+        return stubToolTurn('mcp_fixture_echo', { text: 'hello from jackbot' })
+      }
+      if (/\b(send|email|reply|replies|post|publish)\b/.test(lower)) {
+        return stubToolTurn('hold_for_approval', {
+          action: 'send the 4 queued drafts',
+          detail: 'Four replies are drafted and ready to go out.',
+          kind: 'email',
+          target: 'replies@globex.com',
+        })
+      }
+
+      const url = findUrl(messages)
+      if (url) return stubToolTurn('browser_goto', { url })
+      return stubReport(
+        [
+          { system: 'Web', result: 'sources reviewed', count: '6 pages' },
+          { system: 'Brief', result: 'drafted', count: '0 sent' },
+        ],
+        'One thing needs you today: approve the brief and I will file it.',
+      )
+    },
+  }
+}
+
+/** 系统提示词里「Shared skills」下的第一个技能名 */
+function firstSkill(messages: ChatMsg[]): string | null {
+  const system = String(messages[0]?.content ?? '')
+  const section = system.split('## Shared skills')[1]
+  return section?.match(/^- ([a-z0-9][a-z0-9_-]*)/m)?.[1] ?? null
+}
+
+function stubReport(lines: { system: string; result: string; count?: string }[], closing: string): AssistantTurn {
+  const args = { kind: 'report', payload: { lines, closing } }
+  const toolCall = { id: 'stub-1', type: 'function', function: { name: 'message_user', arguments: JSON.stringify(args) } }
+  return {
+    content: null,
+    toolCalls: [{ id: 'stub-1', name: 'message_user', args }],
+    raw: { role: 'assistant', content: null, tool_calls: [toolCall] },
+  }
+}

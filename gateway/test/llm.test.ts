@@ -1,0 +1,406 @@
+import { describe, expect, it, vi } from 'vitest'
+import { loadConfig, type Config } from '../src/config.js'
+import { createLLM, createLiveLLM, type ChatMsg, type ToolDef } from '../src/llm.js'
+
+const toolDefs: ToolDef[] = [{ type: 'function', function: { name: 'message_user', parameters: {} } }]
+
+describe('createLLM (openai-compatible)', () => {
+  it('POSTs to /chat/completions and maps tool calls', async () => {
+    let captured: { url: string; init: RequestInit } | null = null
+    const fakeFetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      captured = { url: String(url), init: init! }
+      return new Response(JSON.stringify({
+        choices: [{ message: {
+          role: 'assistant', content: null,
+          tool_calls: [{ id: 'c1', type: 'function', function: { name: 'message_user', arguments: '{"kind":"report"}' } }],
+        } }],
+      }))
+    }) as typeof fetch
+    const llm = createLLM(loadConfig({ OPENSUPERBOT_API_KEY: 'sk-x' }), fakeFetch)
+    const turn = await llm.chat([{ role: 'user', content: 'hi' }], toolDefs)
+    expect(captured!.url).toBe('https://api.x.ai/v1/chat/completions')
+    expect((captured!.init.headers as Record<string, string>).Authorization).toBe('Bearer sk-x')
+    expect(turn.toolCalls).toEqual([{ id: 'c1', name: 'message_user', args: { kind: 'report' } }])
+    expect(turn.content).toBeNull()
+  })
+
+  it('throws readable error on non-200', async () => {
+    const fakeFetch = (async () => new Response('quota exceeded', { status: 429 })) as typeof fetch
+    const llm = createLLM(loadConfig({}), fakeFetch, async () => {})
+    await expect(llm.chat([{ role: 'user', content: 'hi' }], [])).rejects.toThrow(/429/)
+  })
+})
+
+const okBody = (extra: Record<string, unknown> = {}) => JSON.stringify({
+  choices: [{ message: { role: 'assistant', content: 'fine' } }],
+  ...extra,
+})
+
+describe('createLLM resilience', () => {
+  const hi: ChatMsg[] = [{ role: 'user', content: 'hi' }]
+
+  it('retries 5xx with backoff and then succeeds', async () => {
+    let calls = 0
+    const waits: number[] = []
+    const fakeFetch = (async () => {
+      calls++
+      return calls < 3 ? new Response('upstream busy', { status: 503 }) : new Response(okBody())
+    }) as typeof fetch
+    const llm = createLLM(loadConfig({}), fakeFetch, async (ms) => { waits.push(ms) })
+    expect((await llm.chat(hi, [])).content).toBe('fine')
+    expect(calls).toBe(3)
+    expect(waits).toHaveLength(2)
+    expect(waits[1]!).toBeGreaterThan(waits[0]!)
+  })
+
+  it('honors Retry-After on 429', async () => {
+    let calls = 0
+    const waits: number[] = []
+    const fakeFetch = (async () => {
+      calls++
+      return calls === 1
+        ? new Response('slow down', { status: 429, headers: { 'retry-after': '2' } })
+        : new Response(okBody())
+    }) as typeof fetch
+    const llm = createLLM(loadConfig({}), fakeFetch, async (ms) => { waits.push(ms) })
+    await llm.chat(hi, [])
+    expect(waits).toEqual([2000])
+  })
+
+  it('does not retry a request the provider rejected', async () => {
+    let calls = 0
+    const fakeFetch = (async () => { calls++; return new Response('bad model', { status: 400 }) }) as typeof fetch
+    const llm = createLLM(loadConfig({}), fakeFetch, async () => {})
+    await expect(llm.chat(hi, [])).rejects.toThrow(/400/)
+    expect(calls).toBe(1)
+  })
+
+  it('gives up on a hung call after the timeout', async () => {
+    const hang = ((_url: string | URL | Request, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
+      init!.signal!.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')))
+    })) as typeof fetch
+    const llm = createLLM(loadConfig({ OPENSUPERBOT_LLM_TIMEOUT_MS: '20', OPENSUPERBOT_LLM_RETRIES: '0' }), hang, async () => {})
+    await expect(llm.chat(hi, [])).rejects.toThrow(/timed out/i)
+  })
+
+  it('stops at once when the operator stops the turn, without retrying', async () => {
+    let calls = 0
+    const hang = ((_url: string | URL | Request, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
+      calls++
+      init!.signal!.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')))
+    })) as typeof fetch
+    const llm = createLLM(loadConfig({}), hang, async () => {})
+    const stop = new AbortController()
+    const pending = llm.chat(hi, [], { signal: stop.signal })
+    stop.abort()
+    await expect(pending).rejects.toThrow()
+    expect(calls).toBe(1)
+  })
+
+  it('reports token usage, including cached prompt tokens', async () => {
+    const fakeFetch = (async () => new Response(okBody({
+      usage: { prompt_tokens: 1200, completion_tokens: 80, prompt_tokens_details: { cached_tokens: 1024 } },
+    }))) as typeof fetch
+    const llm = createLLM(loadConfig({}), fakeFetch)
+    expect((await llm.chat(hi, [])).usage).toEqual({ prompt: 1200, completion: 80, cached: 1024 })
+  })
+
+  it('sends attached images as image_url parts', async () => {
+    let body: { messages: unknown[] } | null = null
+    const fakeFetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+      body = JSON.parse(String(init!.body))
+      return new Response(okBody())
+    }) as typeof fetch
+    const llm = createLLM(loadConfig({}), fakeFetch)
+    await llm.chat([{ role: 'user', content: 'what is on screen?', images: ['data:image/png;base64,AAAA'] }], [])
+    expect(body!.messages[0]).toEqual({
+      role: 'user',
+      content: [
+        { type: 'text', text: 'what is on screen?' },
+        { type: 'image_url', image_url: { url: 'data:image/png;base64,AAAA' } },
+      ],
+    })
+  })
+})
+
+describe('tool choice', () => {
+  const capture = () => {
+    const bodies: Record<string, unknown>[] = []
+    const fakeFetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+      bodies.push(JSON.parse(String(init!.body)))
+      return new Response(JSON.stringify({ choices: [{ message: { role: 'assistant', content: 'ok' } }] }))
+    }) as typeof fetch
+    return { bodies, llm: createLLM(loadConfig({}), fakeFetch) }
+  }
+
+  it('sends tool_choice "none" alongside the tools when asked for a text-only reply', async () => {
+    const { bodies, llm } = capture()
+    await llm.chat([{ role: 'user', content: 'wrap up' }], toolDefs, { toolChoice: 'none' })
+    expect(bodies[0]).toMatchObject({ tools: toolDefs, tool_choice: 'none' })
+  })
+
+  it('leaves tool_choice out otherwise', async () => {
+    const { bodies, llm } = capture()
+    await llm.chat([{ role: 'user', content: 'hi' }], toolDefs)
+    await llm.chat([{ role: 'user', content: 'hi' }], [], { toolChoice: 'none' })
+    expect(bodies.map((b) => 'tool_choice' in b)).toEqual([false, false])
+  })
+})
+
+describe('stub model', () => {
+  it('ignores the time note the gateway appends to the last message', async () => {
+    const llm = createLLM(loadConfig({ OPENSUPERBOT_MODEL: 'stub' }))
+    const turn = await llm.chat([{
+      role: 'user',
+      content: 'from now on quiet accounts wait for my read\n\n(Current time: Sunday 2026-09-27 22:40, Asia/Shanghai. Routine cron expressions run in this timezone.)',
+    }], toolDefs)
+    expect((turn.toolCalls[0]!.args as { rule: string }).rule).toBe('quiet accounts wait for my read')
+  })
+
+  it('first replies with a report tool call, then closes with text', async () => {
+    const llm = createLLM(loadConfig({ OPENSUPERBOT_MODEL: 'stub' }))
+    const messages: ChatMsg[] = [{ role: 'user', content: 'do the thing' }]
+    const first = await llm.chat(messages, toolDefs)
+    expect(first.toolCalls).toHaveLength(1)
+    expect(first.toolCalls[0]!.name).toBe('message_user')
+    expect((first.toolCalls[0]!.args as { kind: string }).kind).toBe('report')
+    messages.push(first.raw, { role: 'tool', tool_call_id: first.toolCalls[0]!.id, content: 'Report delivered.' })
+    const second = await llm.chat(messages, toolDefs)
+    expect(second.toolCalls).toHaveLength(0)
+    expect(second.content).toBeTruthy()
+  })
+
+  it('drives goto → screenshot → closing text when the user names a site', async () => {
+    const llm = createLLM(loadConfig({ OPENSUPERBOT_MODEL: 'stub' }))
+    const messages: ChatMsg[] = [{ role: 'user', content: 'open example.com and show me' }]
+
+    const goto = await llm.chat(messages, toolDefs)
+    expect(goto.toolCalls[0]!.name).toBe('browser_goto')
+    expect(goto.toolCalls[0]!.args).toEqual({ url: 'https://example.com' })
+
+    messages.push(goto.raw, { role: 'tool', tool_call_id: goto.toolCalls[0]!.id, content: 'Now on "Example Domain" (https://example.com/)' })
+    const shot = await llm.chat(messages, toolDefs)
+    expect(shot.toolCalls[0]!.name).toBe('browser_screenshot')
+    expect((shot.toolCalls[0]!.args as { caption: string }).caption).toContain('Example Domain')
+
+    messages.push(shot.raw, { role: 'tool', tool_call_id: shot.toolCalls[0]!.id, content: 'Screenshot posted to the thread.' })
+    const closing = await llm.chat(messages, toolDefs)
+    expect(closing.toolCalls).toHaveLength(0)
+    expect(closing.content).toBeTruthy()
+  })
+
+  it('holds outward actions, saves rules and schedules routines on cue', async () => {
+    const llm = createLLM(loadConfig({ OPENSUPERBOT_MODEL: 'stub' }))
+
+    const hold = await llm.chat([{ role: 'user', content: 'send the replies for me' }], toolDefs)
+    expect(hold.toolCalls[0]!.name).toBe('hold_for_approval')
+
+    const memory = await llm.chat([{ role: 'user', content: 'from now on quiet accounts wait for my read' }], toolDefs)
+    expect(memory.toolCalls[0]!.name).toBe('save_memory')
+    expect((memory.toolCalls[0]!.args as { rule: string }).rule).toBe('quiet accounts wait for my read')
+
+    const routine = await llm.chat([{ role: 'user', content: 'post a digest every day' }], toolDefs)
+    expect(routine.toolCalls[0]!.name).toBe('create_routine')
+    expect((routine.toolCalls[0]!.args as { cron: string }).cron).toBe('0 9 * * *')
+  })
+
+  it('carries out an approved action instead of holding it again', async () => {
+    const llm = createLLM(loadConfig({ OPENSUPERBOT_MODEL: 'stub' }))
+    const approved = await llm.chat(
+      [{ role: 'user', content: 'Your operator approved: send the 4 queued drafts. Carry it out now and report what actually happened.' }],
+      toolDefs,
+    )
+    expect(approved.toolCalls).toHaveLength(0)
+    expect(approved.content).toMatch(/sent/i)
+
+    const discarded = await llm.chat(
+      [{ role: 'user', content: 'Your operator discarded: send the 4 queued drafts. Do not do it. Acknowledge in one line and move on.' }],
+      toolDefs,
+    )
+    expect(discarded.toolCalls).toHaveLength(0)
+    expect(discarded.content).toMatch(/nothing went out/i)
+  })
+
+  it('reports only the part of a batch you approved, and stays quiet on a watch run', async () => {
+    const llm = createLLM(loadConfig({ OPENSUPERBOT_MODEL: 'stub' }))
+    const batch = await llm.chat(
+      [{ role: 'user', content: 'Your operator approved: send the renewal reminder — for exactly these 2 of 3 items:\n1. Globex\n2. Hooli' }],
+      toolDefs,
+    )
+    expect(batch.content).toBe('Sent 2 of 3. The ones you left out did not go out.')
+
+    const watch = await llm.chat(
+      [{ role: 'user', content: 'Your watch routine "Status watch" just fired. Do this now: check it.\n\nThis is a watch run.' }],
+      toolDefs,
+    )
+    expect(watch.content).toBe('Nothing new.')
+  })
+
+  it('closes each workflow path with a short line instead of looping', async () => {
+    const llm = createLLM(loadConfig({ OPENSUPERBOT_MODEL: 'stub' }))
+    const closings = await Promise.all([
+      "Held for your operator's approval. Stop here — do not perform it.",
+      'Routine "Morning digest" scheduled (every day at 09:00).',
+      'Rule saved to MEMORY.md.',
+    ].map((result) => llm.chat([{ role: 'user', content: 'x' }, { role: 'tool', tool_call_id: 't', content: result }], toolDefs)))
+    for (const turn of closings) {
+      expect(turn.toolCalls).toHaveLength(0)
+      expect(turn.content).toBeTruthy()
+    }
+  })
+
+  it('plays its part in a group round and picks up handoffs', async () => {
+    const llm = createLLM(loadConfig({ OPENSUPERBOT_MODEL: 'stub' }))
+
+    const member = await llm.chat(
+      [{ role: 'user', content: 'Your operator asked the group: "where are we?". Answer for your own patch only, in two lines or less.' }],
+      toolDefs,
+    )
+    expect(member.toolCalls).toHaveLength(0)
+    expect(member.content).toBeTruthy()
+
+    const chief = await llm.chat(
+      [{ role: 'user', content: 'Everyone else has reported above. Post the dispatch table now — one line each.' }],
+      toolDefs,
+    )
+    expect(chief.content).toMatch(/→ @/)
+
+    const picked = await llm.chat(
+      [{ role: 'user', content: '@Chief (chief) handed you this: price the tiers by Friday' }],
+      toolDefs,
+    )
+    expect(picked.content).toMatch(/picking it up/i)
+  })
+
+  it('hands off when the operator names a teammate, before treating it as an outward action', async () => {
+    const llm = createLLM(loadConfig({ OPENSUPERBOT_MODEL: 'stub' }))
+
+    const byName = await llm.chat([{ role: 'user', content: 'ask ticker to price the tiers' }], toolDefs)
+    expect(byName.toolCalls[0]!.name).toBe('message_bot')
+    expect((byName.toolCalls[0]!.args as { to: string }).to).toBe('market-watch')
+
+    // "reply" 会撞上扣审批的关键词，点名转交必须优先
+    const withReply = await llm.chat([{ role: 'user', content: 'tell sorter to reply to those two' }], toolDefs)
+    expect(withReply.toolCalls[0]!.name).toBe('message_bot')
+    expect((withReply.toolCalls[0]!.args as { to: string }).to).toBe('inbox-keeper')
+
+    const closing = await llm.chat(
+      [{ role: 'user', content: 'x' }, { role: 'tool', tool_call_id: 't', content: 'Handed to Ticker.' }],
+      toolDefs,
+    )
+    expect(closing.toolCalls).toHaveLength(0)
+    expect(closing.content).toMatch(/handed off/i)
+  })
+
+  it('asks for a takeover at a login wall instead of guessing credentials', async () => {
+    const llm = createLLM(loadConfig({ OPENSUPERBOT_MODEL: 'stub' }))
+    const asked = await llm.chat([{ role: 'user', content: 'work my zendesk queue' }], toolDefs)
+    expect(asked.toolCalls[0]!.name).toBe('ask_for_login')
+    expect((asked.toolCalls[0]!.args as { site: string }).site).toBe('Zendesk')
+
+    const waiting = await llm.chat(
+      [
+        { role: 'user', content: 'x' },
+        { role: 'tool', tool_call_id: 't', content: 'Asked your operator to sign in to Zendesk. Stop here until they say it is done.' },
+      ],
+      toolDefs,
+    )
+    expect(waiting.toolCalls).toHaveLength(0)
+    expect(waiting.content).toMatch(/waiting on you/i)
+  })
+
+  it('keeps full urls as written', async () => {
+    const llm = createLLM(loadConfig({ OPENSUPERBOT_MODEL: 'stub' }))
+    const turn = await llm.chat([{ role: 'user', content: 'check https://news.ycombinator.com/news please' }], toolDefs)
+    expect(turn.toolCalls[0]!.args).toEqual({ url: 'https://news.ycombinator.com/news' })
+  })
+})
+
+describe('createLiveLLM', () => {
+  type Seen = { url: string; auth: string | undefined; model: string }
+  function recordingFetch(gate?: Promise<void>) {
+    const seen: Seen[] = []
+    const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
+      seen.push({
+        url: String(url),
+        auth: (init!.headers as Record<string, string>).Authorization,
+        model: JSON.parse(String(init!.body)).model,
+      })
+      if (gate) await gate
+      return new Response(JSON.stringify({ choices: [{ message: { role: 'assistant', content: 'ok' } }] }))
+    }) as typeof fetch
+    return { seen, fetchImpl }
+  }
+
+  it('uses whatever the settings say at the moment of each call', async () => {
+    let config = loadConfig({ OPENSUPERBOT_API_KEY: 'sk-old', OPENSUPERBOT_MODEL: 'grok-4' })
+    const { seen, fetchImpl } = recordingFetch()
+    const llm = createLiveLLM(() => config, (c) => createLLM(c, fetchImpl))
+    await llm.chat([{ role: 'user', content: 'hi' }], [])
+    config = { ...config, baseURL: 'https://api.deepseek.com/v1', model: 'deepseek-chat', apiKey: 'sk-new' }
+    await llm.chat([{ role: 'user', content: 'hi' }], [])
+    expect(seen).toEqual([
+      { url: 'https://api.x.ai/v1/chat/completions', auth: 'Bearer sk-old', model: 'grok-4' },
+      { url: 'https://api.deepseek.com/v1/chat/completions', auth: 'Bearer sk-new', model: 'deepseek-chat' },
+    ])
+  })
+
+  it('lets a call already in flight finish on the settings it started with', async () => {
+    let config = loadConfig({ OPENSUPERBOT_API_KEY: 'sk-old' })
+    let open!: () => void
+    const { seen, fetchImpl } = recordingFetch(new Promise((r) => { open = r }))
+    const llm = createLiveLLM(() => config, (c) => createLLM(c, fetchImpl))
+    const first = llm.chat([{ role: 'user', content: 'hi' }], [])
+    await vi.waitFor(() => expect(seen).toHaveLength(1))
+    config = { ...config, apiKey: 'sk-new' }
+    open()
+    expect((await first).content).toBe('ok')
+    await llm.chat([{ role: 'user', content: 'hi' }], [])
+    expect(seen.map((s) => s.auth)).toEqual(['Bearer sk-old', 'Bearer sk-new'])
+  })
+
+  it('builds a client only when something that matters changed, and can switch to the stub', async () => {
+    let config = loadConfig({ OPENSUPERBOT_API_KEY: 'sk-1' })
+    const { fetchImpl } = recordingFetch()
+    const make = vi.fn((c: Config) => createLLM(c, fetchImpl))
+    const llm = createLiveLLM(() => config, make)
+    await llm.chat([{ role: 'user', content: 'hi' }], [])
+    config = { ...config, vision: true, port: 5000 } // 跟模型客户端无关
+    await llm.chat([{ role: 'user', content: 'hi' }], [])
+    expect(make).toHaveBeenCalledTimes(1)
+    config = { ...config, model: 'stub' }
+    const stubbed = await llm.chat([{ role: 'user', content: 'say hi' }], toolDefs)
+    expect(make).toHaveBeenCalledTimes(2)
+    expect(stubbed.content ?? stubbed.toolCalls[0]?.name).toBeTruthy()
+  })
+
+  it('reports a settings read that fails as an error on that call', async () => {
+    const llm = createLiveLLM(() => { throw new Error('EACCES: llm-key') })
+    await expect(llm.chat([{ role: 'user', content: 'hi' }], [])).rejects.toThrow(/llm-key/)
+  })
+})
+
+describe('provider-specific request fields', () => {
+  it('adds them to every call, but never lets them replace the model, messages or tools', async () => {
+    let body: Record<string, unknown> = {}
+    const fakeFetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+      body = JSON.parse(String(init!.body))
+      return new Response(JSON.stringify({ choices: [{ message: { role: 'assistant', content: 'ok' } }] }))
+    }) as typeof fetch
+    const config = { ...loadConfig({ OPENSUPERBOT_MODEL: 'gpt-6-luna' }), extraBody: { reasoning_effort: 'none', model: 'hijacked', messages: [] } }
+    await createLLM(config, fakeFetch).chat([{ role: 'user', content: 'hi' }], toolDefs)
+    expect(body).toMatchObject({ reasoning_effort: 'none', model: 'gpt-6-luna' })
+    expect(body.messages).toHaveLength(1)
+    expect(body.tools).toHaveLength(1)
+  })
+
+  it('count as a change of client when they change', async () => {
+    let config = { ...loadConfig({}), extraBody: {} as Record<string, unknown> }
+    const make = vi.fn((c: Config) => createLLM(c, (async () => new Response(JSON.stringify({ choices: [{ message: { role: 'assistant', content: 'ok' } }] }))) as typeof fetch))
+    const llm = createLiveLLM(() => config, make)
+    await llm.chat([{ role: 'user', content: 'hi' }], [])
+    config = { ...config, extraBody: { enable_thinking: false } }
+    await llm.chat([{ role: 'user', content: 'hi' }], [])
+    expect(make).toHaveBeenCalledTimes(2)
+  })
+})

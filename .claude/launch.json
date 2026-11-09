@@ -1,0 +1,23 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "gateway-stub",
+      "runtimeExecutable": "env",
+      "runtimeArgs": ["JACKBOT_MODEL=stub", "JACKBOT_DATA=data-stub", "pnpm", "--filter", "@jackbot/gateway", "dev"],
+      "port": 4747
+    },
+    {
+      "name": "gateway-local-stub",
+      "runtimeExecutable": "env",
+      "runtimeArgs": ["JACKBOT_MODEL=stub", "JACKBOT_COMPUTERS=local", "JACKBOT_DATA=data-local-stub", "pnpm", "--filter", "@jackbot/gateway", "dev"],
+      "port": 4747
+    },
+    {
+      "name": "web",
+      "runtimeExecutable": "pnpm",
+      "runtimeArgs": ["--filter", "@jackbot/web", "dev"],
+      "port": 5173
+    }
+  ]
+}

@@ -1,0 +1,373 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import {
+  ApiError, SignedOut, answerQuestion, checkSession, connectEvents, createBot, fetchBots, fetchComputer, fetchConnections, fetchConversations,
+  fetchLanguage, fetchMessages, fetchProviders, forgetMemoryRule, resolveApproval, revokeRule, sendMessage, setComputerShell, setComputerWindow,
+  stopThread, updateRoutine,
+} from './api'
+import { BotModelChip, BotModelPicker } from './components/BotModelPicker'
+import { ComputerPanel } from './components/ComputerPanel'
+import { ConnectorsDialog } from './components/ConnectorsDialog'
+import { ModelsDialog } from './components/ModelsDialog'
+import { NewBotForm } from './components/NewBotForm'
+import { Sidebar } from './components/Sidebar'
+import { Thread } from './components/Thread'
+import { I18nProvider, browserLanguages, pickLang, useT, type Lang } from './i18n'
+import { errorText } from './i18n/describe'
+import { applyHello, applyStatus, clearDone } from './presence'
+import type { BotStatus, ComputerInfo, ConnectionsState, Conversation, Message, ProviderPreset, RoutineAction } from './types'
+
+/** 网关锁着：告诉人去哪拿登录链接，而不是一片空白。 */
+function SignIn() {
+  const t = useT()
+  return (
+    <main className="signin">
+      <div className="signin-card">
+        <div className="signin-title">{t('signin.title')}</div>
+        <p>{withCode(t('signin.body'), 'link', `${location.origin}/auth?token=…`)}</p>
+        <p className="signin-hint">{withCode(t('signin.hint'), 'path', 'gateway/data/auth-token')}</p>
+      </div>
+    </main>
+  )
+}
+
+/** 句子里有一段要排成代码：按占位切开，代码段放进 <code>，语序由译文决定 */
+function withCode(text: string, name: string, code: string) {
+  const [before, after = ''] = text.split(`{${name}}`)
+  return <>{before}<code>{code}</code>{after}</>
+}
+
+/**
+ * 语言 = 设置里存的 → 否则跟浏览器。先按浏览器出一版（不等网络），设置拿回来再换；
+ * 锁着的网关拿不到设置，登录页就按浏览器的语言。
+ */
+export default function App() {
+  const [lang, setLang] = useState<Lang>(() => pickLang(undefined, browserLanguages()))
+  useEffect(() => {
+    let live = true
+    void fetchLanguage().then((saved) => { if (live) setLang(pickLang(saved, browserLanguages())) })
+    return () => { live = false }
+  }, [])
+  useEffect(() => { document.documentElement.lang = lang }, [lang])
+  return <I18nProvider lang={lang}><Workspace /></I18nProvider>
+}
+
+function Workspace() {
+  const t = useT()
+  const [signedOut, setSignedOut] = useState<boolean | null>(null)
+  const [connectorsOn, setConnectorsOn] = useState(false)
+  const [connectorsOpen, setConnectorsOpen] = useState(false)
+  useEffect(() => {
+    if (signedOut !== false) return
+    void fetch('/api/mcp').then((res) => { if (res.ok) setConnectorsOn(true) }).catch(() => {})
+  }, [signedOut])
+  const [conversations, setConversations] = useState<Conversation[]>([])
+  const [roster, setRoster] = useState<Record<string, { name: string; emoji: string }>>({})
+  const [selectedId, setSelectedId] = useState<string | null>(null)
+  const [messages, setMessages] = useState<Message[]>([])
+  const [statuses, setStatuses] = useState<Record<string, BotStatus>>({})
+  /** 电脑面板开给谁；info 为 null 表示那台电脑还在醒 */
+  const [panel, setPanel] = useState<{ botId: string; info: ComputerInfo | null } | null>(null)
+  const [hiring, setHiring] = useState(false)
+  const [hireError, setHireError] = useState<string | undefined>()
+  /** 模型连接和每位同事的选择；老网关没有这块就一直是 null */
+  const [llms, setLlms] = useState<ConnectionsState | null>(null)
+  const [providers, setProviders] = useState<ProviderPreset[]>([])
+  /** 开着的是哪个窗口：「AI 模型」总表，或给某位同事选模型 */
+  const [modelsOpen, setModelsOpen] = useState(false)
+  const [pickerFor, setPickerFor] = useState<string | null>(null)
+
+  const selected = useMemo(
+    () => conversations.find((c) => c.id === selectedId) ?? null,
+    [conversations, selectedId],
+  )
+  const threadId = selected?.id ?? null
+  const threadIdRef = useRef<string | null>(null)
+  useEffect(() => { threadIdRef.current = threadId }, [threadId])
+  // 正看着的线程里有谁：他们干完了你自己看得见，不用再标「done」；点开的那一刻把已有的「done」消掉
+  const watchingRef = useRef<string[]>([])
+  /** 这一轮忙碌里真往线程说过话的同事：只有它们收工时才标「done」 */
+  const postedRef = useRef(new Set<string>())
+  const members = selected?.members.join(',') ?? ''
+  useEffect(() => {
+    const ids = members ? members.split(',') : []
+    watchingRef.current = ids
+    setStatuses((s) => clearDone(s, ids))
+  }, [members])
+  // 面板此刻属于谁，同步记在 ref 里：拉起电脑要十几秒，结果回来时人可能早换了线程或关了面板
+  const panelFor = useRef<string | null>(null)
+  const showPanel = useCallback((next: { botId: string; info: ComputerInfo | null } | null) => {
+    panelFor.current = next?.botId ?? null
+    setPanel(next)
+  }, [])
+  // 面板属于某一位同事：换了线程就收起，免得新名字盖在旧屏幕上
+  useEffect(() => { showPanel(null) }, [selectedId, showPanel])
+
+  /** 拉消息期间经 WS 到达的更新先记下来，拉回来后叠在快照上，免得被旧快照覆盖掉 */
+  const liveDuringFetch = useRef<Map<number, Message> | null>(null)
+  const loadMessages = useCallback(async (thread: string) => {
+    const mine = new Map<number, Message>()
+    liveDuringFetch.current = mine
+    try {
+      const fetched = await fetchMessages(thread)
+      const live = liveDuringFetch.current ?? new Map<number, Message>()
+      if (threadIdRef.current !== thread) return
+      const merged = fetched.map((m) => live.get(m.id) ?? m)
+      const known = new Set(merged.map((m) => m.id))
+      for (const m of live.values()) if (!known.has(m.id)) merged.push(m)
+      setMessages(merged.sort((a, b) => a.id - b.id))
+    } finally {
+      // 只清自己的记账：两次拉取重叠时，晚到的那次不能把正在飞的那次的记账抹掉
+      if (liveDuringFetch.current === mine) liveDuringFetch.current = null
+    }
+  }, [])
+
+  const guard = useCallback((err: unknown) => {
+    if (err instanceof SignedOut) setSignedOut(true)
+    else console.error(err)
+  }, [])
+
+  const refreshConversations = useCallback(async () => {
+    const cs = await fetchConversations()
+    setConversations(cs)
+    setSelectedId((id) => id ?? cs[0]?.id ?? null)
+  }, [])
+
+  const loadRoster = useCallback(async () => {
+    const bs = await fetchBots()
+    // 群里要按 id 显示说话人，所以单独拉一份名册
+    setRoster(Object.fromEntries(bs.map((b) => [b.id, { name: b.name, emoji: b.emoji }])))
+  }, [])
+
+  /** 模型连接是锦上添花：拿不到（老网关、网络抖）不影响别的，界面上那一块不显示就是了 */
+  const loadLlms = useCallback(async () => {
+    try {
+      const [state, presets] = await Promise.all([fetchConnections(), fetchProviders()])
+      setLlms(state)
+      setProviders(presets)
+    } catch (err) {
+      if (err instanceof SignedOut) throw err
+    }
+  }, [])
+
+  /** 首次加载和每次重连都走这里：断线期间错过的消息、审批数、名册一次补齐。 */
+  const resync = useCallback(async () => {
+    try {
+      await Promise.all([refreshConversations(), loadRoster(), loadLlms()])
+      const current = threadIdRef.current
+      if (current) await loadMessages(current)
+    } catch (err) {
+      guard(err)
+    }
+  }, [guard, loadLlms, loadMessages, loadRoster, refreshConversations])
+
+  useEffect(() => {
+    checkSession()
+      .then((ok) => {
+        setSignedOut(!ok)
+        if (ok) void resync()
+      })
+      .catch(() => setSignedOut(false)) // 网关没起来：先显示空界面，WS 重连上以后会补拉
+  }, [resync])
+
+  useEffect(() => {
+    if (!threadId) return
+    setMessages([])
+    loadMessages(threadId).catch(guard)
+  }, [threadId, guard, loadMessages])
+
+  useEffect(() => {
+    if (signedOut !== false) return
+    return connectEvents((e) => {
+      if (e.type === 'hello') {
+        setStatuses((s) => applyHello(s, e.statuses))
+        void resync()
+        return
+      }
+      if (e.type === 'status') {
+        if (e.state === 'thinking') postedRef.current.delete(e.botId)
+        const posted = postedRef.current.has(e.botId)
+        if (e.state !== 'thinking') postedRef.current.delete(e.botId)
+        setStatuses((s) => applyStatus(s, e.botId, e.state, watchingRef.current.includes(e.botId), posted))
+        return
+      }
+      if (e.type !== 'message') return // 向导之类的事件不归这里管；更新的网关发来不认识的也一样
+      if (e.message.sender !== 'user' && e.message.kind !== 'activity') postedRef.current.add(e.message.sender)
+      // 就地更新的旧消息（activity 卡片收尾、审批 chip 翻转）不该顶掉更新的那条预览
+      setConversations((cs) => cs.map((c) => (
+        c.id === e.threadId && e.message.id >= (c.last_message?.id ?? 0) ? { ...c, last_message: e.message } : c
+      )))
+      // 审批、问题来了或定了，侧栏的「等你」计数要跟着变
+      if (['approval_request', 'approval_resolved', 'question'].includes(e.message.kind)) {
+        void refreshConversations().catch(guard)
+      }
+      if (e.threadId === threadIdRef.current) {
+        liveDuringFetch.current?.set(e.message.id, e.message)
+        // 同 id 就替换：审批 chip 被放行、activity 卡片多了一步，都是就地更新
+        setMessages((ms) => {
+          const at = ms.findIndex((m) => m.id === e.message.id)
+          if (at === -1) return [...ms, e.message]
+          const next = [...ms]
+          next[at] = e.message
+          return next
+        })
+      }
+    })
+  }, [signedOut, resync, refreshConversations, guard])
+
+  const waiting = conversations.reduce((sum, c) => sum + (c.pending ?? 0), 0)
+  useEffect(() => {
+    document.title = waiting ? `(${waiting}) ${t('app.title')}` : t('app.title')
+  }, [waiting, t])
+
+  /** 拉一次面板数据；只在面板还开给同一位同事时才放进去 */
+  const loadPanel = async (botId: string) => {
+    try {
+      const info = await fetchComputer(botId)
+      if (panelFor.current === botId) showPanel({ botId, info })
+    } catch (err) {
+      if (panelFor.current === botId) showPanel(null)
+      guard(err)
+    }
+  }
+
+  const openScreen = () => {
+    if (!selected || selected.kind !== 'dm') return
+    const botId = selected.members[0]
+    if (!botId) return
+    if (panel?.botId === botId && !panel.info) return // 已经在等它醒了
+    // 已经开着就原地刷新，不闪回加载态；没开就先把面板亮出来
+    showPanel({ botId, info: panel?.botId === botId ? panel.info : null })
+    void loadPanel(botId)
+  }
+
+  const onRoutine = async (id: number, action: RoutineAction) => {
+    if (action === 'delete' && !window.confirm(t('app.confirmDeleteRoutine'))) return
+    try {
+      await updateRoutine(id, action)
+      if (panel) await loadPanel(panel.botId)
+    } catch (err) {
+      guard(err)
+    }
+  }
+
+  const onRevokeRule = async (id: number) => {
+    try {
+      await revokeRule(id)
+      if (panel) await loadPanel(panel.botId)
+    } catch (err) {
+      guard(err)
+    }
+  }
+
+  const onForgetRule = async (rule: string) => {
+    if (!panel || !window.confirm(t('app.confirmForgetRule', { rule }))) return
+    try {
+      await forgetMemoryRule(panel.botId, rule)
+      await loadPanel(panel.botId)
+    } catch (err) {
+      guard(err)
+    }
+  }
+
+  /** 本机模式的两个动作：网关拒了（没沙箱、自检失败）就把原因抛回面板显示；不管成败都刷新面板 */
+  const panelAction = async (run: (botId: string) => Promise<void>) => {
+    if (!panel) return
+    try {
+      await run(panel.botId)
+    } catch (err) {
+      if (err instanceof SignedOut) { setSignedOut(true); return }
+      throw err
+    } finally {
+      await loadPanel(panel.botId)
+    }
+  }
+  const onWindowDone = () => panelAction((botId) => setComputerWindow(botId, false))
+  const onShell = (enabled: boolean) => panelAction((botId) => setComputerShell(botId, enabled))
+
+  const hire = async (name: string, role: string) => {
+    try {
+      const bot = await createBot(name, role)
+      setHiring(false)
+      setHireError(undefined)
+      await refreshConversations()
+      setSelectedId(`dm:${bot.id}`)
+      await Promise.all([loadRoster(), loadLlms()])
+    } catch (err) {
+      if (err instanceof SignedOut) setSignedOut(true)
+      else setHireError(err instanceof ApiError ? errorText(t, err) : err instanceof Error ? err.message : String(err))
+    }
+  }
+
+  if (signedOut) return <SignIn />
+
+  const thinking = selected ? selected.members.some((id) => statuses[id] === 'thinking') : false
+
+  return (
+    <div className="app">
+      <Sidebar
+        conversations={conversations}
+        selectedId={selectedId}
+        statuses={statuses}
+        onSelect={setSelectedId}
+        onNewBot={() => { setHireError(undefined); setHiring(true) }}
+        {...(llms ? { onModels: () => setModelsOpen(true) } : {})}
+        {...(connectorsOn ? { onConnectors: () => setConnectorsOpen(true) } : {})}
+      />
+      {selected ? (
+        <Thread
+          conversation={selected}
+          messages={messages}
+          thinking={thinking}
+          roster={roster}
+          onSend={(text) => { if (threadId) sendMessage(threadId, text).catch(guard) }}
+          onDecide={(approvalId, decision, remember, items) => {
+            resolveApproval(approvalId, decision, remember, items).catch(guard)
+          }}
+          onAnswer={(messageId, choices) => answerQuestion(messageId, choices).catch((err) => { guard(err); throw err })}
+          onOpenScreen={openScreen}
+          onStop={() => { if (threadId) stopThread(threadId).catch(guard) }}
+          headerExtra={llms && selected.kind === 'dm' && selected.members[0] ? (
+            <BotModelChip botId={selected.members[0]} state={llms} providers={providers} onOpen={() => setPickerFor(selected.members[0]!)} />
+          ) : null}
+        />
+      ) : (
+        <main className="thread thread-empty">{t('app.noTeammates')}</main>
+      )}
+      {panel ? (
+        <ComputerPanel
+          info={panel.info}
+          botName={selected?.title ?? ''}
+          onClose={() => showPanel(null)}
+          onRoutine={(id, action) => { void onRoutine(id, action) }}
+          onRevokeRule={(id) => { void onRevokeRule(id) }}
+          onForgetRule={(rule) => { void onForgetRule(rule) }}
+          onWindowDone={onWindowDone}
+          onShell={onShell}
+        />
+      ) : null}
+      {connectorsOpen ? <ConnectorsDialog onClose={() => setConnectorsOpen(false)} /> : null}
+      {llms && modelsOpen ? (
+        <ModelsDialog state={llms} providers={providers} roster={roster} onChange={setLlms} onClose={() => setModelsOpen(false)} />
+      ) : null}
+      {llms && pickerFor && !modelsOpen ? (
+        <BotModelPicker
+          botId={pickerFor}
+          botName={roster[pickerFor]?.name ?? pickerFor}
+          state={llms}
+          providers={providers}
+          onSaved={(botId, llm) => setLlms((s) => (s ? { ...s, bots: { ...s.bots, [botId]: llm } } : s))}
+          onManage={() => { setPickerFor(null); setModelsOpen(true) }}
+          onClose={() => setPickerFor(null)}
+        />
+      ) : null}
+      {hiring ? (
+        <div className="modal-scrim" onClick={() => setHiring(false)}>
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-title">{t('app.hireTitle')}</div>
+            <NewBotForm onCreate={(n, r) => void hire(n, r)} onCancel={() => setHiring(false)} error={hireError} />
+          </div>
+        </div>
+      ) : null}
+    </div>
+  )
+}

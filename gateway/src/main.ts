@@ -1,0 +1,235 @@
+import { mkdirSync } from 'node:fs'
+import { dirname, join } from 'node:path'
+import { serve, upgradeWebSocket } from '@hono/node-server'
+import Docker from 'dockerode'
+import { WebSocketServer } from 'ws'
+import { parseA2AAllow } from './a2a.js'
+import { pruneActions } from './actions.js'
+import { loadOrCreateToken, trustedOrigins } from './auth.js'
+import { createBrowserProvisioner } from './browsers.js'
+import { chooseBackend, createDockerBackend, createLocalBackend, dockerReachable } from './backend.js'
+import { adoptLegacyEnv, loadConfig } from './config.js'
+import { envRaw, envSourceName, shadowedByJackbot } from './env-names.js'
+import { botShellEnabled, openDb } from './db.js'
+import { botConfig } from './connections.js'
+import { createLLM, createLiveLLM } from './llm.js'
+import { migrateLegacyMemories } from './memory.js'
+import { botImageReady } from './containers.js'
+import { createPool, reapIdleComputers } from './pool.js'
+import { listRoutines } from './routines.js'
+import { createScreenViewers, mountScreenProxy, screenRelay, screencastRelay } from './screen.js'
+import { detectSandbox, sandboxHint, sandboxMissing, sandboxSelfCheck } from './sandbox.js'
+import { createScheduler, type Scheduler } from './scheduler.js'
+import { seedGroup, seedTeammates } from './seed.js'
+import { createApp } from './server.js'
+import { currentConfig, readSavedSettings, resolveSettings } from './settings.js'
+import { serveWeb } from './web.js'
+
+// OPENGROKBOT_* still fills OPENSUPERBOT_* when the newer name is unset.
+// loadConfig itself prefers JACKBOT_*, then OPENSUPERBOT_*, then OPENGROKBOT_*.
+const legacyEnv = adoptLegacyEnv(process.env)
+if (legacyEnv.adopted.length) {
+  console.warn(`[jackbot] still honoring ${legacyEnv.adopted.join(', ')}. JACKBOT_… is the name to use.`)
+}
+if (legacyEnv.shadowed.length) {
+  console.warn(`[jackbot] ignoring ${legacyEnv.shadowed.join(', ')}: OPENSUPERBOT_… is also set, and it wins over OPENGROKBOT_….`)
+}
+const jackbotWins = shadowedByJackbot(process.env)
+if (jackbotWins.length) {
+  console.warn(`[jackbot] ignoring ${jackbotWins.join(', ')}: JACKBOT_… is set too, and it wins.`)
+}
+const startup = loadConfig()
+mkdirSync(startup.dataDir, { recursive: true })
+if (startup.dbPath !== ':memory:') mkdirSync(dirname(startup.dbPath), { recursive: true })
+const db = openDb(startup.dbPath, {
+  onBackup: (file) => console.log(`[gateway] backed up the database before upgrading it → ${file}`),
+  onMigrate: (from, to) => console.log(`[gateway] database schema v${from} → v${to}`),
+})
+// 界面上存的设置（库里）和 key 文件（<data>/llm-key）叠到启动配置上；设了环境变量的项仍以环境变量为准。
+// 模型和看图每次现读（改了下一次调用就生效），浏览器镜像下载前现读；电脑种类只在这里读一次，改了要重启
+const live = () => currentConfig(startup, process.env, db)
+const config = live()
+// 预置样板来自版本库，用户新雇的同事住在数据目录
+const bots = [
+  ...seedTeammates(db, config.teammatesDir),
+  ...seedTeammates(db, join(config.dataDir, 'teammates')),
+]
+seedGroup(db, { id: config.groupId, title: config.groupTitle, memberIds: bots })
+const movedMemories = await migrateLegacyMemories(config.dataDir, bots)
+if (movedMemories.length) console.log(`[gateway] moved MEMORY.md out of the workspaces of: ${movedMemories.join(', ')}`)
+const llm = createLiveLLM(live)
+// 每位同事各用各的模型连接：回合开始时按它此刻的选择现造一个客户端（改了设置下一回合就用上）
+const llmFor = (botId: string) => {
+  const own = botConfig(startup, process.env, db, botId)
+  return { llm: createLLM(own), vision: own.vision }
+}
+// 同事的电脑是什么做的：有 Docker 用容器，没有就用本机模式（宿主上的浏览器 + 一个文件夹）
+const docker = new Docker()
+const sandbox = detectSandbox()
+// 本机模式的浏览器：第一次要电脑时和向导里「先下载」共用这一个，不会两头同时下
+const browser = createBrowserProvisioner({
+  dataDir: config.dataDir,
+  browser: config.browser,
+  mirror: () => live().browserMirror,
+  log: (line) => console.log(`[gateway] ${line}`),
+})
+const computersFrom = resolveSettings(process.env, readSavedSettings(db)).sources.computers
+const { backend, why: backendWhy, reason: backendReason } = await chooseBackend(config.computers, {
+  docker: () => createDockerBackend(docker, {
+    dataDir: config.dataDir,
+    containerOptions: { memoryMb: config.botMemoryMb, cpus: config.botCpus, timeZone: config.timeZone },
+    log: (line) => console.log(`[gateway] ${line}`),
+  }),
+  local: () => createLocalBackend({
+    dataDir: config.dataDir,
+    resolveBrowser: () => browser.ensure(),
+    log: (line) => console.log(`[gateway] ${line}`),
+    // 命令行按同事开关（存数据库）；开了也只在系统沙箱里跑，没沙箱就没有命令行
+    shell: { enabled: (botId) => botShellEnabled(db, botId), sandbox },
+  }),
+  dockerReachable: () => dockerReachable(docker),
+  dockerImageReady: () => botImageReady(docker),
+  ...(computersFrom === 'default' ? {} : {
+    from: computersFrom,
+    ...(computersFrom === 'env' ? { envName: envSourceName(process.env, 'COMPUTERS') ?? 'JACKBOT_COMPUTERS' } : {}),
+  }),
+})
+console.log(`[gateway] bot computers: ${backend.kind} (${backendReason})`)
+const pool = createPool({ dataDir: config.dataDir, backend })
+// 令牌放在数据目录（0600），不在任何 bot 的 workspace 里：容器里的 bot 拿不到它
+const token = loadOrCreateToken(config.dataDir, config.token)
+
+// scheduler 的触发回调要用 createApp 产出的 runRoutine——用一个盒子打破这个先有鸡还是先有蛋
+const schedulerBox: { current?: Scheduler } = {}
+const schedulerProxy: Scheduler = {
+  add: (r) => schedulerBox.current?.add(r),
+  remove: (id) => schedulerBox.current?.remove(id),
+  load: (rs) => schedulerBox.current?.load(rs),
+  stopAll: () => schedulerBox.current?.stopAll(),
+  size: () => schedulerBox.current?.size() ?? 0,
+}
+
+const gateway = createApp({
+  db, llm, llmFor, pool, dataDir: config.dataDir, scheduler: schedulerProxy,
+  computers: {
+    kind: backend.kind,
+    why: backendWhy,
+    reason: backendReason,
+    sandbox: sandbox ? { available: true } : { available: false, why: sandboxHint(), whyCode: sandboxMissing() },
+    checkSandbox: (botId) => sandbox
+      ? sandboxSelfCheck(sandbox, { workspace: join(config.dataDir, 'workspaces', botId), tmp: join(config.dataDir, 'bots', botId, 'tmp'), dataDir: config.dataDir })
+      : Promise.resolve({ ok: false as const, why: sandboxHint() }),
+  },
+  chiefId: config.chiefId,
+  a2aRules: parseA2AAllow(config.a2aAllow, config.chiefId),
+  token,
+  allowedOrigins: trustedOrigins(config),
+  dailyTokens: config.dailyTokens,
+  vision: () => live().vision,
+  timeZone: config.timeZone,
+  maxSteps: config.maxSteps,
+  turnMinutes: config.turnMinutes,
+  settings: { env: process.env, startedWith: config },
+  setup: { browser, dockerReachable: () => dockerReachable(docker, 1_500), dockerImageReady: () => botImageReady(docker) },
+})
+const { app, hub } = gateway
+
+schedulerBox.current = createScheduler({
+  run: async (routine) => {
+    const outcome = await gateway.runRoutine(routine)
+    if (outcome === 'skipped') {
+      console.log(`[gateway] routine #${routine.id} "${routine.name}" is still running — skipped this firing`)
+    }
+  },
+})
+schedulerBox.current.load(listRoutines(db))
+
+// 动作日志留 90 天：启动时清一次，之后每天清一次
+const ACTION_LOG_DAYS = 90
+const pruneOldActions = () => {
+  const removed = pruneActions(db, Date.now() - ACTION_LOG_DAYS * 24 * 60 * 60_000)
+  if (removed) console.log(`[gateway] dropped ${removed} action-log entries older than ${ACTION_LOG_DAYS} days`)
+}
+pruneOldActions()
+setInterval(pruneOldActions, 24 * 60 * 60_000).unref()
+
+// WebSocket 用 node-server 自带的支持：升级请求照样先过 app（令牌、来源检查都在），二进制帧交成 ArrayBuffer
+app.get('/ws', upgradeWebSocket(() => ({
+  onOpen: (_evt, ws) => {
+    hub.add(ws)
+    ws.send(JSON.stringify(gateway.hello()))
+  },
+  onClose: (_evt, ws) => hub.remove(ws),
+})))
+
+// 屏幕：noVNC 页面和它的 WebSocket 都经网关转发——同源、同一个登录，一条隧道就能远程接管
+const knownBot = (botId: string) => Boolean(db.prepare('SELECT 1 FROM bots WHERE id = ?').get(botId))
+const viewers = createScreenViewers()
+app.get('/vnc/:botId/websockify', upgradeWebSocket(async (c) => {
+  const botId = c.req.param('botId') ?? ''
+  if (!knownBot(botId)) throw new Error(`unknown bot ${botId}`)
+  const screen = (await pool.get(botId)).screen
+  if (!screen) throw new Error(`${botId} has no screen`)
+  return screenRelay(`${screen.base.replace(/^http/, 'ws')}/websockify`, {
+    onOpen: () => viewers.open(botId),
+    onClose: () => viewers.close(botId),
+  })
+}))
+// 本机电脑没有 VNC：屏幕是网关订阅的浏览器截屏流
+app.get('/screen/:botId/ws', upgradeWebSocket(async (c) => {
+  const botId = c.req.param('botId') ?? ''
+  if (!knownBot(botId)) throw new Error(`unknown bot ${botId}`)
+  const computer = await pool.get(botId)
+  return screencastRelay(computer, { onOpen: () => viewers.open(botId), onClose: () => viewers.close(botId) })
+}))
+mountScreenProxy(app, { knownBot })
+
+// pnpm build 之后网关直接托管前端：一个端口、一个进程；dev 下前端走 Vite（5173）
+const servingWeb = serveWeb(app, config.webDist)
+
+serve({
+  fetch: app.fetch,
+  port: config.port,
+  hostname: config.host,
+  websocket: { server: new WebSocketServer({ noServer: true }) },
+}, (info) => {
+  const base = config.webUrl || `http://localhost:${info.port}`
+  console.log(
+    `[jackbot] listening on ${config.host}:${info.port} · model=${config.model}` +
+    ` · bots: ${bots.join(', ') || '(none)'} · routines: ${schedulerProxy.size()}` +
+    (servingWeb ? ' · serving the built UI' : ''),
+  )
+  // 常驻服务的日志可能落盘，设了 JACKBOT_QUIET_TOKEN（或旧名字）就不把令牌写进日志
+  if (envRaw(process.env, 'QUIET_TOKEN')) {
+    console.log(`[jackbot] sign in → ${base}/auth?token=<the token in ${join(config.dataDir, 'auth-token')}>`)
+  } else {
+    console.log(`[jackbot] sign in → ${base}/auth?token=${token}`)
+  }
+})
+
+// 空闲的电脑停机省内存；登录态和文件都在 workspace 里，下次用时原样拉起
+if (config.idleStopMinutes > 0) {
+  const startedAt = Date.now()
+  const timer = setInterval(() => {
+    reapIdleComputers({
+      pool,
+      idleMs: config.idleStopMinutes * 60_000,
+      runningBots: () => backend.running(),
+      isBusy: (botId) => gateway.isBusy(botId) || viewers.watching(botId),
+      stop: (botId) => backend.stop(botId),
+      now: Date.now(),
+      startedAt,
+    })
+      .then((reaped) => { if (reaped.length) console.log(`[gateway] stopped idle computers: ${reaped.join(', ')}`) })
+      .catch(() => { /* 没开 Docker 就没有电脑可回收 */ })
+  }, 60_000)
+  timer.unref()
+}
+
+// bot 的电脑该长期在线：退出只断 CDP 连接，容器留着（也保住浏览器登录态）
+for (const signal of ['SIGINT', 'SIGTERM'] as const) {
+  process.on(signal, () => {
+    schedulerProxy.stopAll()
+    void gateway.stopMcp().finally(() => pool.disposeAll().finally(() => process.exit(0)))
+  })
+}

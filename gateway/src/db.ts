@@ -1,0 +1,476 @@
+import { existsSync, readdirSync, rmSync } from 'node:fs'
+import { basename, dirname, join } from 'node:path'
+import Database from 'better-sqlite3'
+
+export type Db = Database.Database
+export type MessageKind =
+  | 'text'
+  | 'report'
+  | 'screenshot'
+  | 'approval_request'
+  | 'approval_resolved'
+  | 'memory_updated'
+  | 'routine_created'
+  | 'bot_ref'
+  | 'login_request'
+  | 'activity'
+  | 'question'
+  | 'webhook'
+
+export type BotRow = {
+  id: string
+  name: string
+  role: string
+  emoji: string
+  soul_path: string
+  /** 本机电脑上允许跑命令（1）；容器电脑不看这个字段 */
+  shell_enabled?: number
+  /** 这位同事用哪个模型连接；NULL = 默认连接 */
+  llm_connection?: string | null
+  /** 在那个连接上换用的模型；NULL = 连接自己的默认模型 */
+  llm_model?: string | null
+}
+
+export type MessageRow = {
+  id: number
+  thread_id: string
+  sender: string // 'user' | bot id | 'webhook'
+  kind: MessageKind
+  content: string
+  payload: unknown | null
+  created_at: number
+}
+
+export type SidebarBot = BotRow & { thread_id: string; last_message: MessageRow | null }
+
+const SCHEMA = `
+CREATE TABLE IF NOT EXISTS bots (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  role TEXT NOT NULL DEFAULT '',
+  emoji TEXT NOT NULL DEFAULT '🤖',
+  soul_path TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS threads (
+  id TEXT PRIMARY KEY,
+  kind TEXT NOT NULL DEFAULT 'dm',
+  bot_id TEXT,
+  title TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS thread_members (
+  thread_id TEXT NOT NULL,
+  bot_id TEXT NOT NULL,
+  joined_at INTEGER NOT NULL,
+  PRIMARY KEY (thread_id, bot_id)
+);
+CREATE TABLE IF NOT EXISTS messages (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  thread_id TEXT NOT NULL,
+  sender TEXT NOT NULL,
+  kind TEXT NOT NULL DEFAULT 'text',
+  content TEXT NOT NULL DEFAULT '',
+  payload TEXT,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_messages_thread ON messages(thread_id, id);
+CREATE TABLE IF NOT EXISTS approvals (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  thread_id TEXT NOT NULL,
+  bot_id TEXT NOT NULL,
+  action TEXT NOT NULL,
+  detail TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'pending',
+  message_id INTEGER,
+  created_at INTEGER NOT NULL,
+  resolved_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_approvals_thread ON approvals(thread_id, status);
+CREATE TABLE IF NOT EXISTS routines (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  bot_id TEXT NOT NULL,
+  name TEXT NOT NULL,
+  cron TEXT NOT NULL,
+  instructions TEXT NOT NULL,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  created_at INTEGER NOT NULL,
+  last_run_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_routines_bot ON routines(bot_id, enabled);
+CREATE TABLE IF NOT EXISTS usage (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  bot_id TEXT NOT NULL,
+  thread_id TEXT NOT NULL,
+  prompt_tokens INTEGER NOT NULL DEFAULT 0,
+  completion_tokens INTEGER NOT NULL DEFAULT 0,
+  cached_tokens INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_usage_bot ON usage(bot_id, created_at);
+`
+
+/**
+ * 迁移一步一格：新库从 0 跑到底，老库从自己记着的版本接着跑。版本号存在 SQLite 文件头的
+ * user_version 里，和数据同生共死。要加表、加列、补索引，就在末尾追加一步——已经发布过的步骤不再改。
+ */
+export type Migration = (db: Db) => void
+
+const MIGRATIONS: Migration[] = [
+  // v1：v0.2 的基线。v0.2.x 的老库表都在、版本号却是 0——这一步对它是空操作，只把版本号补上。
+  (db) => db.exec(SCHEMA),
+  // v2：审批带上类别和去向，好让操作者的「以后都放行」落成规则；规则表；routine 的 webhook 密钥；
+  // 按 kind 找消息（还没回答的问题卡片要算进「等你」）
+  (db) => db.exec(`
+    ALTER TABLE approvals ADD COLUMN kind TEXT NOT NULL DEFAULT 'other';
+    ALTER TABLE approvals ADD COLUMN target TEXT NOT NULL DEFAULT '';
+    ALTER TABLE approvals ADD COLUMN rule_id INTEGER;
+    CREATE TABLE IF NOT EXISTS approval_rules (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      bot_id TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      target TEXT NOT NULL,
+      expires_at INTEGER,
+      created_at INTEGER NOT NULL,
+      source_approval_id INTEGER,
+      revoked_at INTEGER
+    );
+    CREATE INDEX IF NOT EXISTS idx_rules_bot ON approval_rules(bot_id, kind);
+    ALTER TABLE routines ADD COLUMN webhook_key TEXT;
+    CREATE INDEX IF NOT EXISTS idx_messages_kind ON messages(kind);
+  `),
+  // v3：只看不动的 watch routine；一次扣住一批对象的审批（及操作者勾留下的那几项）；每位同事的动作日志
+  (db) => db.exec(`
+    ALTER TABLE routines ADD COLUMN mode TEXT NOT NULL DEFAULT 'act';
+    ALTER TABLE approvals ADD COLUMN items TEXT;
+    ALTER TABLE approvals ADD COLUMN approved_items TEXT;
+    CREATE TABLE IF NOT EXISTS actions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      bot_id TEXT NOT NULL,
+      thread_id TEXT NOT NULL,
+      trigger TEXT NOT NULL DEFAULT '',
+      tool TEXT NOT NULL,
+      summary TEXT NOT NULL DEFAULT '',
+      ok INTEGER,
+      ms INTEGER,
+      created_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_actions_bot ON actions(bot_id, id);
+    CREATE INDEX IF NOT EXISTS idx_actions_time ON actions(created_at);
+  `),
+  // v4：本机电脑的命令行开关，按同事存（操作者在面板上做的决定，要看得见、能撤）
+  (db) => db.exec(`ALTER TABLE bots ADD COLUMN shell_enabled INTEGER NOT NULL DEFAULT 0;`),
+  // v5：recorded workflows belong beside routines and actions in the teammate database, not as loose files.
+  (db) => db.exec(`
+    CREATE TABLE IF NOT EXISTS workflows (
+      id TEXT PRIMARY KEY,
+      bot_id TEXT NOT NULL,
+      title TEXT NOT NULL,
+      trace_json TEXT NOT NULL,
+      created_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_workflows_bot ON workflows(bot_id, created_at DESC, id DESC);
+  `),
+  // v6：操作者在界面上改的设置（服务商、模型、语言……），值是 JSON；API key 不在这里，单独放 <data>/llm-key。
+  // m7-desktop 合并 main 之前把设置表当 v5 建过：那样的库停在 v5、没有 workflows，这里顺手补上（都是 IF NOT EXISTS）
+  (db) => db.exec(`
+    CREATE TABLE IF NOT EXISTS settings (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS workflows (
+      id TEXT PRIMARY KEY,
+      bot_id TEXT NOT NULL,
+      title TEXT NOT NULL,
+      trace_json TEXT NOT NULL,
+      created_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_workflows_bot ON workflows(bot_id, created_at DESC, id DESC);
+  `),
+  // v7：同时接好几家模型，每个同事各用各的。「默认」那个连接还是 settings 里的那套，这里只放另加的；
+  // key 不进库，放 <data>/llm-keys/<连接 id>。同事没选（NULL）就用默认连接
+  (db) => {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS connections (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        provider TEXT NOT NULL,
+        api TEXT NOT NULL,
+        base_url TEXT NOT NULL,
+        model TEXT NOT NULL,
+        vision INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+    `)
+    // 列已经在就不再加：被手动退回老版本号的库（升级测试、回滚过的库）重跑这一步不该炸
+    const have = new Set((db.pragma('table_info(bots)') as { name: string }[]).map((c) => c.name))
+    if (!have.has('llm_connection')) db.exec('ALTER TABLE bots ADD COLUMN llm_connection TEXT')
+    if (!have.has('llm_model')) db.exec('ALTER TABLE bots ADD COLUMN llm_model TEXT')
+  },
+]
+
+export const SCHEMA_VERSION = MIGRATIONS.length
+
+export function schemaVersion(db: Db): number {
+  return Number(db.pragma('user_version', { simple: true }))
+}
+
+/** 把库从它现在的版本升到 steps 的末尾；每一步连同版本号一起落在一个事务里，断电也不会留下半步。 */
+export function runMigrations(db: Db, steps: Migration[]): { from: number; to: number } {
+  const from = schemaVersion(db)
+  if (from > steps.length) {
+    throw new Error(
+      `This database was written by a newer jackbot (schema v${from}; this build knows v${steps.length}). `
+      + 'Upgrade the gateway, or point JACKBOT_DATA at a different directory.',
+    )
+  }
+  for (let v = from; v < steps.length; v++) {
+    db.transaction(() => {
+      steps[v]!(db)
+      db.pragma(`user_version = ${v + 1}`)
+    })()
+  }
+  return { from, to: steps.length }
+}
+
+export function migrate(db: Db): { from: number; to: number } {
+  return runMigrations(db, MIGRATIONS)
+}
+
+/** 每个库最多留这么多份迁移前备份，旧的删掉 */
+export const KEEP_BACKUPS = 3
+
+const stamp = (d: Date) => d.toISOString().replace(/[-:]/g, '').replace(/\.\d+Z$/, 'Z')
+const sqlString = (s: string) => `'${s.replace(/'/g, "''")}'`
+
+/**
+ * 迁移只能往前走：升级后的库，老版本的网关打不开。所以动手之前先用 VACUUM INTO 留一份完整、一致的
+ * 备份（WAL 里的内容也在里面），放在库文件旁边：<库>.v<旧>-before-v<新>.<时间>.bak。只留最近 KEEP_BACKUPS 份。
+ * 备份失败就不迁移：宁可网关起不来，也不在没有退路的情况下改用户的数据。
+ */
+export function backupBeforeMigration(db: Db, path: string, from: number, to: number, now: Date): string {
+  const base = basename(path)
+  const file = join(dirname(path), `${base}.v${from}-before-v${to}.${stamp(now)}.bak`)
+  try {
+    db.exec(`VACUUM INTO ${sqlString(file)}`)
+  } catch (err) {
+    throw new Error(
+      `Could not back up ${path} before upgrading its schema v${from} → v${to} (${err instanceof Error ? err.message : String(err)}). `
+      + 'Nothing was changed. Free some disk space or copy the file somewhere safe, then start the gateway again.',
+    )
+  }
+  const mine = readdirSync(dirname(path))
+    .filter((f) => f.startsWith(`${base}.v`) && /\.v\d+-before-v\d+\.\d{8}T\d{6}Z\.bak$/.test(f))
+    .sort()
+  for (const old of mine.slice(0, Math.max(0, mine.length - KEEP_BACKUPS))) rmSync(join(dirname(path), old), { force: true })
+  return file
+}
+
+export function openDb(
+  path = ':memory:',
+  opts: { onMigrate?: (from: number, to: number) => void; onBackup?: (file: string) => void; now?: () => Date } = {},
+): Db {
+  const existed = path !== ':memory:' && existsSync(path)
+  const db = new Database(path)
+  db.pragma('journal_mode = WAL')
+  const before = schemaVersion(db)
+  // 只有真有东西可丢时才备份：新建的空库、已经是最新的库、更新的网关写的库（下面会直接拒绝）都不用
+  const hasData = existed && Number(db.prepare(`SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table'`).pluck().get()) > 0
+  if (hasData && before < SCHEMA_VERSION) {
+    const file = backupBeforeMigration(db, path, before, SCHEMA_VERSION, (opts.now ?? (() => new Date()))())
+    opts.onBackup?.(file)
+  }
+  const { from, to } = migrate(db)
+  if (from !== to) opts.onMigrate?.(from, to)
+  return db
+}
+
+/** 空的 role/emoji 表示「来源没写」，不能拿它覆盖库里已有的值——否则每次重启都会抹掉新同事的职位。 */
+export function upsertBot(db: Db, bot: BotRow): void {
+  db.prepare(
+    `INSERT INTO bots (id, name, role, emoji, soul_path, created_at)
+     VALUES (@id, @name, @role, COALESCE(NULLIF(@emoji, ''), '🤖'), @soul_path, @created_at)
+     ON CONFLICT(id) DO UPDATE SET
+       name = @name,
+       role = CASE WHEN @role <> '' THEN @role ELSE bots.role END,
+       emoji = CASE WHEN @emoji <> '' THEN @emoji ELSE bots.emoji END,
+       soul_path = @soul_path`,
+  ).run({ ...bot, created_at: Date.now() })
+}
+
+/** 本机电脑的命令行：开或关。不存在的同事返回 false。 */
+export function setBotShell(db: Db, botId: string, enabled: boolean): boolean {
+  return db.prepare('UPDATE bots SET shell_enabled = ? WHERE id = ?').run(enabled ? 1 : 0, botId).changes > 0
+}
+
+export function botShellEnabled(db: Db, botId: string): boolean {
+  const row = db.prepare('SELECT shell_enabled FROM bots WHERE id = ?').get(botId) as { shell_enabled: number } | undefined
+  return row?.shell_enabled === 1
+}
+
+export function ensureDmThread(db: Db, botId: string): string {
+  const id = `dm:${botId}`
+  db.prepare(`INSERT OR IGNORE INTO threads (id, kind, bot_id, created_at) VALUES (?, 'dm', ?, ?)`)
+    .run(id, botId, Date.now())
+  return id
+}
+
+export function insertMessage(
+  db: Db,
+  m: { threadId: string; sender: string; kind: MessageKind; content?: string; payload?: unknown },
+): MessageRow {
+  const createdAt = Date.now()
+  const payloadJson = m.payload === undefined ? null : JSON.stringify(m.payload)
+  const info = db.prepare(
+    `INSERT INTO messages (thread_id, sender, kind, content, payload, created_at) VALUES (?, ?, ?, ?, ?, ?)`,
+  ).run(m.threadId, m.sender, m.kind, m.content ?? '', payloadJson, createdAt)
+  return {
+    id: Number(info.lastInsertRowid),
+    thread_id: m.threadId,
+    sender: m.sender,
+    kind: m.kind,
+    content: m.content ?? '',
+    payload: m.payload ?? null,
+    created_at: createdAt,
+  }
+}
+
+function parseRow(r: Record<string, unknown>): MessageRow {
+  return { ...r, payload: r.payload ? JSON.parse(r.payload as string) : null } as MessageRow
+}
+
+export function listMessages(db: Db, threadId: string, limit = 200): MessageRow[] {
+  const rows = db.prepare(`SELECT * FROM messages WHERE thread_id = ? ORDER BY id DESC LIMIT ?`)
+    .all(threadId, limit) as Record<string, unknown>[]
+  return rows.reverse().map(parseRow)
+}
+
+export function listBotsWithLastMessage(db: Db): SidebarBot[] {
+  const bots = db.prepare(`SELECT * FROM bots ORDER BY name`).all() as BotRow[]
+  const lastStmt = db.prepare(`SELECT * FROM messages WHERE thread_id = ? ORDER BY id DESC LIMIT 1`)
+  return bots.map((b) => {
+    const threadId = `dm:${b.id}`
+    const last = lastStmt.get(threadId) as Record<string, unknown> | undefined
+    return { ...b, thread_id: threadId, last_message: last ? parseRow(last) : null }
+  })
+}
+
+export function getMessage(db: Db, id: number): MessageRow | null {
+  const row = db.prepare('SELECT * FROM messages WHERE id = ?').get(id) as Record<string, unknown> | undefined
+  return row ? parseRow(row) : null
+}
+
+export type UsageTotals = { prompt: number; completion: number; cached: number; total: number }
+
+export function recordUsage(
+  db: Db,
+  input: { botId: string; threadId: string; usage: { prompt: number; completion: number; cached: number }; at: number },
+): void {
+  db.prepare(
+    `INSERT INTO usage (bot_id, thread_id, prompt_tokens, completion_tokens, cached_tokens, created_at)
+     VALUES (?, ?, ?, ?, ?, ?)`,
+  ).run(input.botId, input.threadId, input.usage.prompt, input.usage.completion, input.usage.cached, input.at)
+}
+
+export function usageSince(db: Db, botId: string, since: number): UsageTotals {
+  const row = db.prepare(
+    `SELECT COALESCE(SUM(prompt_tokens), 0) AS prompt, COALESCE(SUM(completion_tokens), 0) AS completion,
+            COALESCE(SUM(cached_tokens), 0) AS cached
+     FROM usage WHERE bot_id = ? AND created_at >= ?`,
+  ).get(botId, since) as { prompt: number; completion: number; cached: number }
+  return { ...row, total: row.prompt + row.completion }
+}
+
+export function updateMessagePayload(db: Db, messageId: number, payload: unknown): void {
+  db.prepare('UPDATE messages SET payload = ? WHERE id = ?').run(JSON.stringify(payload), messageId)
+}
+
+export type Conversation = {
+  id: string
+  kind: 'dm' | 'group'
+  title: string
+  emoji: string
+  subtitle: string
+  members: string[]
+  last_message: MessageRow | null
+  /** 这个线程里还等着人的事：没拍板的审批 + 没回答的问题 */
+  pending: number
+}
+
+export function ensureGroupThread(db: Db, id: string, title: string, memberIds: string[]): string {
+  const now = Date.now()
+  db.prepare(`INSERT INTO threads (id, kind, bot_id, title, created_at) VALUES (?, 'group', NULL, ?, ?)
+              ON CONFLICT(id) DO UPDATE SET title = excluded.title`).run(id, title, now)
+  const add = db.prepare('INSERT OR IGNORE INTO thread_members (thread_id, bot_id, joined_at) VALUES (?, ?, ?)')
+  memberIds.forEach((botId, i) => add.run(id, botId, now + i))
+  return id
+}
+
+export function threadMembers(db: Db, threadId: string): string[] {
+  return (db.prepare('SELECT bot_id FROM thread_members WHERE thread_id = ? ORDER BY joined_at, bot_id')
+    .all(threadId) as { bot_id: string }[]).map((r) => r.bot_id)
+}
+
+function lastMessageOf(db: Db, threadId: string): MessageRow | null {
+  const row = db.prepare('SELECT * FROM messages WHERE thread_id = ? ORDER BY id DESC LIMIT 1')
+    .get(threadId) as Record<string, unknown> | undefined
+  return row ? parseRow(row) : null
+}
+
+/** 每个线程里等着人的东西：没拍板的审批 + 没回答的问题卡片 */
+function pendingByThread(db: Db): Map<string, number> {
+  const rows = db.prepare(
+    `SELECT thread_id, COUNT(*) AS n FROM (
+       SELECT thread_id FROM approvals WHERE status = 'pending'
+       UNION ALL
+       SELECT thread_id FROM messages WHERE kind = 'question' AND json_extract(payload, '$.status') = 'open'
+     ) GROUP BY thread_id`,
+  ).all() as { thread_id: string; n: number }[]
+  return new Map(rows.map((r) => [r.thread_id, r.n]))
+}
+
+/** 某位同事手上有没有等着操作者的事：待批的审批、没回答的问题，或者它最后一句话是在请人登录 */
+export function waitsOnOperator(db: Db, botId: string): boolean {
+  const held = db.prepare(`SELECT 1 FROM approvals WHERE bot_id = ? AND status = 'pending' LIMIT 1`).get(botId)
+  if (held) return true
+  const asked = db.prepare(
+    `SELECT 1 FROM messages WHERE kind = 'question' AND sender = ? AND json_extract(payload, '$.status') = 'open' LIMIT 1`,
+  ).get(botId)
+  if (asked) return true
+  const last = lastMessageOf(db, `dm:${botId}`)
+  return last?.kind === 'login_request' && last.sender === botId
+}
+
+export function listConversations(db: Db): Conversation[] {
+  const bots = db.prepare('SELECT * FROM bots ORDER BY name').all() as BotRow[]
+  const byId = new Map(bots.map((b) => [b.id, b]))
+  const pending = pendingByThread(db)
+  const dms: Conversation[] = bots.map((b) => ({
+    id: `dm:${b.id}`,
+    kind: 'dm',
+    title: b.name,
+    emoji: b.emoji,
+    subtitle: b.role,
+    members: [b.id],
+    last_message: lastMessageOf(db, `dm:${b.id}`),
+    pending: pending.get(`dm:${b.id}`) ?? 0,
+  }))
+  const groupRows = db.prepare(`SELECT * FROM threads WHERE kind = 'group' ORDER BY title`)
+    .all() as { id: string; title: string }[]
+  const groups: Conversation[] = groupRows.map((t) => {
+    const members = threadMembers(db, t.id)
+    return {
+      id: t.id,
+      kind: 'group',
+      title: t.title,
+      emoji: '👥',
+      subtitle: members.map((id) => byId.get(id)?.name ?? id).join(', '),
+      members,
+      last_message: lastMessageOf(db, t.id),
+      pending: pending.get(t.id) ?? 0,
+    }
+  })
+  return [...dms, ...groups]
+}

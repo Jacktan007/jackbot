@@ -1,0 +1,491 @@
+# Changelog
+
+What changed, release by release. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
+versions follow [Semantic Versioning](https://semver.org/) while the project is pre-1.0, so a minor version can
+still change behaviour. The project was called OpenGrokBot until November 2026, so entries before that use the old
+names.
+
+## [Unreleased]
+
+This tree is **jackbot**. It vendors [OpenSuperBot](https://github.com/wolfqing/OpenSuperBot) (MIT) and adds stdio MCP connectors beside each teammate's computer. `JACKBOT_*` is the env prefix. `OPENSUPERBOT_*` and `OPENGROKBOT_*` still work when the jackbot name is unset. The vendored computer image remains `opensuperbot/bot:dev`.
+
+### Added
+
+- MCP connectors: stdio client, `<data>/mcp.json`, a secret vault, Connectors in the sidebar, and presets (Playwright, Chrome DevTools, GitHub, filesystem, memory, sequential thinking, Context7, Slack, Notion). Outward tools wait for an approval of those exact arguments. Watch routines do not receive MCP tools.
+- `JACKBOT_*` environment variables, with the older prefixes kept as aliases. New databases default to `jackbot.db`.
+
+### Security
+
+- **Only turns you start can change a teammate's standing setup.** Saving or forgetting a rule and creating or
+  stopping a routine used to work in any turn, so text in a webhook payload, a page a routine read, or a
+  teammate's handoff could have left a new routine or removed one of your rules behind. These four tools are now
+  offered only in a turn you started, refused if the model names them anyway in any other turn, and the attempt
+  is logged. Handing work to a teammate still works from any turn.
+
+## [0.5.0] - 2026-11-08
+
+Each teammate can run on its own AI: Claude, OpenAI, xAI, Gemini, MiniMax and other OpenAI-compatible
+services, each connection with its own key. Also a Chinese UI, local computers and start at sign-in on
+Windows, CI on Linux, macOS and Windows, a first slice of browser workflow recording, and several security
+fixes.
+
+**OpenGrokBot is now OpenSuperBot**, a name that no longer borrows xAI's "Grok". Existing installs upgrade in
+place: see [Coming from OpenGrokBot](docs/always-on.md#coming-from-opengrokbot).
+
+### Security
+
+- A local computer's screen stream (`/screen/:botId/ws`) was served without the gateway's token and origin
+  checks; it is now guarded like the noVNC path.
+- Sandboxed commands can no longer read the operator's home directory. Both sandboxes hide it entirely and put
+  back only runtime managers (`~/.nvm`, `~/.volta`, `~/.pyenv`, `~/.cargo/bin`, …) read-only; before, Seatbelt
+  denied a short list of key folders and bubblewrap denied none of them. The self-check now also fails if a
+  command can list the home directory, and the switch refuses to turn on when no self-check is wired.
+- `write_file` on a local computer opens the final path component without following symlinks.
+- On Windows the gateway token file is limited to your account: its access list is reset (which also clears entries
+  written on the file itself, such as the creator's default `SYSTEM` and `Administrators` grants), inherited access is
+  removed, and only your user (by SID) is granted. Before, `0600` did nothing there and the file kept whatever its
+  folder allowed. Start-up warns if it cannot restrict the file, and an existing token is tightened on the next
+  start.
+- A local computer's file tools refuse Windows device names (`CON`, `NUL`, `COM1`, … — reading `CON` would wait for
+  input forever) and colons, which would write into an alternate data stream.
+- The gateway runs on hono 4.13.16 and `@hono/node-server` 2.1.6, which fix several advisories. The one that reached
+  the gateway: a client that dropped its connection while the gateway was still setting up a WebSocket (a screen
+  viewer while the teammate's browser starts, say) raised an unhandled socket error and stopped the process
+  (GHSA-qv5m-9pm6-hqp3). The server also no longer turns a backslash in the path into `/`, which could carry a
+  request past a reverse proxy's path rules (GHSA-jpvv-r467-5p4w). The rest do not apply here: the origin check
+  reads the `Host` header rather than the request URL (GHSA-7v5p-43qr-wch5), the token check is a single `*`
+  middleware, and the gateway uses neither `mount()` nor the form validator. ws 8.22.1, `@types/node` 26.6.6 and
+  `@vitejs/plugin-react` 6.2.1 came in the same update.
+
+### Added
+
+- Each teammate can run on its own AI. **AI models** (the `AI` button next to `+` in the sidebar) lists your
+  connections — a service, its API key and a default model — and adds, tests, edits or deletes them; the top of
+  a teammate's thread shows which connection and model it uses, and a click switches it from its next turn.
+  The connection set up first (the settings and env vars from before) stays the default for every teammate
+  that has not picked one. Schema v7 adds a `connections` table and two columns on `bots`; each extra
+  connection's key lives in `<data>/llm-keys/<id>`, never in the database. Only your account can read it (mode
+  `0600` in a `0700` folder; on Windows, an ACL for your account alone), and the API only ever returns it
+  masked. Deleting a connection moves its teammates back to the default.
+- Claude through its own Messages API (the official `@anthropic-ai/sdk`), not the OpenAI-compatible shim:
+  tool calls, screenshots, and Claude's thinking blocks handed back untouched within a turn. Requests use
+  automatic prompt caching, and on Anthropic's own API the server-side refusal fallback for the models that
+  have it; a decline that remains becomes a readable error instead of an empty reply. A custom connection can
+  also speak this API, for services that offer an Anthropic-compatible endpoint.
+- The OpenAI Responses API as a third way to talk to a model, with the reasoning items handed back within a
+  turn (`store: false`, encrypted reasoning).
+- More presets, checked against each provider's docs on 2026-11-07: Claude (`claude-opus-5-5`, effort `medium`),
+  Gemini through AI Studio's OpenAI-compatible endpoint (`gemini-3.5-flash-lite`), MiniMax for the global and
+  China sites (`MiniMax-M3.1-Flash`, reasoning effort `low` instead of its default `max`), and MiniMax M Plan, the
+  one subscription plan whose terms let any compatible tool connect: the form shows its terms and wants a tick
+  before it saves one. The GLM, Kimi and Alibaba coding plans are left out on purpose; their terms forbid use from
+  your own apps, bots or automation. OpenAI and xAI now talk over the Responses API: every GPT-6 model can call
+  tools there (on Chat Completions most cannot), OpenAI's preset asks for reasoning effort `low`, and xAI marks
+  Chat Completions deprecated. [AI models](docs/models.md) lists the services and which subscriptions other apps
+  may use.
+- A Claude Pro/Max sign-in token (`sk-ant-oat…`) is refused wherever a key is saved or tested, with a note to
+  create an API key in the Claude Console instead: Anthropic does not allow other apps to use subscription
+  sign-ins.
+- `GET/POST /api/connections`, `PATCH/DELETE /api/connections/:id`, `POST /api/connections/test`,
+  `GET /api/connections/:id/models` and `PUT /api/bots/:id/llm`. The default connection keeps the settings
+  rules: fields pinned by env vars stay `locked`. Changing a connection's address without a new key drops the
+  stored key, a test against a new address never sends the old key, and moving a connection to another service
+  resets the models teammates picked on it. A Claude connection without a key refuses to run instead of letting
+  the SDK pick up Anthropic credentials or `ANTHROPIC_CUSTOM_HEADERS` from the machine; a reply cut off at the
+  output limit is reported instead of acted on.
+- The gateway keeps settings of its own (schema v6 adds a `settings` table): provider, API base, model, vision,
+  language, computers, browser mirror and update checks. An env var still wins over a saved value. The model API
+  key can live in `<data>/llm-key` instead of `OPENSUPERBOT_API_KEY`. Like the gateway token next to it, only your
+  account can read it (mode `0600`; on Windows, an ACL for your account alone), and it is out of reach of
+  sandboxed commands and containers. The AI models dialog writes the model settings; the rest have no UI yet.
+- Model settings apply without a restart: the API base, model, key and vision are read again before each model
+  call, so a change takes effect on the next call while a call already in flight finishes as it started. The
+  choice of computers and the browser mirror still apply at startup.
+- Settings API for the coming wizard and settings page. `GET /api/settings` returns each value and where it
+  comes from (`env`, `saved`, `default`); the key is only ever returned masked (`sk-…3456`), with its source
+  (`env`, `file`, `none`); `needsRestart` lists the saved changes that wait for a restart. `PUT /api/settings`
+  saves a batch, key included, or nothing at all: values pinned by env vars are refused as `locked`.
+  `POST /api/settings/test` tries a provider before you save, first `GET /models` and then a 16-token chat, and
+  sorts failures into codes (`bad_key`, `quota`, `rate_limited`, `model_not_found`, `unreachable`, `timeout`,
+  `provider_error`). The saved key is only sent when the API base is unchanged, so one provider's key never goes
+  to another. `GET /api/settings/models` lists the saved provider's models.
+- Provider presets (`GET /api/settings/providers`) for DeepSeek, Kimi, Qwen (Model Studio, Beijing), GLM, xAI,
+  OpenAI, OpenRouter, a local Ollama and any OpenAI-compatible endpoint: address, where to get a key, a default
+  model that calls tools, whether it takes images. They were checked against each provider's docs on 2026-11-03.
+  A preset can add request fields the provider needs: DeepSeek and Qwen get thinking turned off; OpenAI's GPT-6
+  models only call tools on Chat Completions with `reasoning_effort: "none"`. The connection test sends the same
+  fields, and treats a 400 that names the key (xAI's answer to a wrong key) as `bad_key`.
+- `GET /api/setup` tells the coming first-run wizard whether it is needed and what the computers have to work
+  with. It is not needed once there is a key, a provider that needs none, the demo model, or any model env var,
+  so existing setups never see it. It reports Docker, the sandbox, the browser found or missing, and how big the
+  download is (about 190 MB, 370 MB on disk). In a mainland China time zone it suggests the npmmirror.com
+  mirror. `POST /api/setup/browser` downloads the browser ahead of time, and `/ws` pushes `setup.browser`
+  progress (which item, percent, size) as it goes.
+- The first local computer and the wizard share one browser download instead of possibly running two into the
+  same folder. The browser mirror is read when the download starts, so changing it no longer needs a restart.
+- With `computers` on `auto`, a gateway whose Docker is running but whose bot image is not built now uses local
+  computers, instead of handing out Docker computers that fail on first use. An image built before the rename
+  (`opengrokbot/bot:dev`) counts as built. The log says why and gives the `docker build` command.
+  `GET /api/setup` adds `docker.imageReady` and the reason the computers were picked (`why`: `chosen`,
+  `docker_running`, `docker_not_running`, `docker_image_missing`), and a choice made on the settings page is
+  logged as such rather than as `OPENSUPERBOT_COMPUTERS`. Settings ask for a restart only when it would change
+  the computers: switching `auto` to `local` on a gateway that already runs local computers does not.
+- The UI speaks Chinese. Every label, button and hint in the web UI comes from a dictionary
+  (`web/src/i18n/en.ts`, with `zh-CN.ts` beside it); the language is the one saved in settings, otherwise the
+  browser's, otherwise English. Dates and numbers follow it too. A missing Chinese entry fails the build, and a
+  test checks that each translation fills in the same values as the English. Word choices are in
+  `web/src/i18n/GLOSSARY.md`. What teammates say stays in their own words.
+- Reasons the gateway sends back now carry a code the UI translates, next to the same English as before: why a
+  computer did not start (Docker not running, bot image not built, browser missing or failed to download), why
+  commands cannot be turned on, why a release cannot become a rule, a taken teammate name. The lines the gateway
+  posts for a teammate (stopped, hit an error, over budget, paused at a limit) keep their English text for the
+  model and add a `notice` payload; schedules are described in the UI's language from the cron expression.
+- Teammates write in the operator's interface language when one is saved in settings, and otherwise in the
+  language the operator writes in.
+- First teach-mode slice: record semantic browser actions on the teammate's existing page, review the draft before
+  saving it to SQLite, redact sensitive input, and reattach across local-computer window relaunches. API-only; replay
+  and routines remain out of scope.
+- **Local computers on Windows**, with the browser and the folder: the gateway finds Chrome, Edge, Chromium or Brave
+  where Windows installs them (for all users or just you) and otherwise downloads Chrome for Testing. Commands stay
+  off, because Windows has no sandbox as strong as Seatbelt or bubblewrap; a teammate that needs a shell there
+  gets a Docker computer.
+- **Start at sign-in on Windows**: `deploy/windows/install-task.ps1` registers a Task Scheduler task that runs the
+  gateway as you, in your session (so a sign-in window can appear), and restarts it if it stops.
+- **CI on Linux, macOS and Windows.** Typecheck, tests and build run on all three, and a new job runs the
+  local-computer smoke test on each against the runner's real Chrome — on Linux with bubblewrap and a virtual
+  display, on macOS with Seatbelt, on Windows with the extra path checks. The Windows job also installs and removes
+  the start-up task.
+- `deploy/linux/bwrap.apparmor`: the AppArmor profile bubblewrap needs on Ubuntu 23.10 and later, which otherwise
+  stop it from creating the user namespace it sandboxes commands in. CI applies the same file.
+
+### Changed
+
+- Renamed to OpenSuperBot. Environment variables are `OPENSUPERBOT_*`, the packages `@opensuperbot/*`, the bot image
+  `opensuperbot/bot:dev`, its containers `opensuperbot-<id>`, the webhook header `X-OpenSuperBot-Key` and the workflow
+  format `opensuperbot.workflow`. The start-up templates are `ai.opensuperbot.gateway` (launchd),
+  `opensuperbot.service` (systemd) and the `OpenSuperBot gateway` task (Windows).
+- Nothing breaks for an existing install:
+  - `OPENGROKBOT_*` variables are still read when the new name is unset, and start-up lists the old names it saw.
+  - An existing `opengrokbot.db` stays in use.
+  - The old sign-in cookie and the `X-OpenGrokBot-Key` header are still accepted, and workflows saved as
+    `opengrokbot.workflow` still load.
+  - Docker computers named `opengrokbot-<id>` are replaced on first use; sign-ins live in the workspace, so they
+    carry over. An image built as `opengrokbot/bot:dev` is tagged with the new name instead of rebuilt.
+  - Running `install-task.ps1` again removes the old Windows task, so two gateways never fight over the port.
+- A teammate no longer edits earlier messages when it takes a new screenshot. The older screenshots are swapped
+  for a placeholder when the request is sent, the same as before, except on Claude: Claude rejects later
+  thinking blocks once anything before them changes, so it keeps up to ten (prompt caching makes the repeats
+  cheap) and folds the oldest five away at a time, asking Anthropic's API to drop the thinking blocks that no
+  longer match.
+- `PUT /api/settings` refuses to change the provider or API base while `OPENSUPERBOT_API_KEY` pins the key (that
+  key belongs to one service), and drops a saved key when the API base changes without a new one.
+- The default model is now `grok-4.7` (was `grok-4`, which no longer appears in xAI's model list). If you never
+  set `OPENSUPERBOT_MODEL`, the gateway starts asking xAI for `grok-4.7`; it reasons by default and costs more per
+  token than the older Grok models. Set `OPENSUPERBOT_MODEL` to keep a different model.
+- `pnpm install` no longer compiles better-sqlite3. Its package carries prebuilt binaries for macOS, Linux and
+  Windows and loads them in preference anyway, so the compile was wasted everywhere and, on Windows, failed without
+  Visual Studio's C++ tools. Installing on Windows now needs no compiler.
+- `pnpm dev` works in PowerShell and cmd: the gateway's dev script set its default UI address with Unix shell
+  syntax, which Windows rejected; the default now lives in `gateway/scripts/dev.ts`.
+- Every file is checked out with LF line endings (`.gitattributes`). On Windows git would otherwise convert them, and
+  a bot image built from that checkout fails at `entrypoint.sh` with `/bin/bash^M: bad interpreter`.
+- The READMEs and docs give PowerShell versions of the commands and describe Windows local computers.
+- The READMEs describe local computers wherever they still assumed Docker: the FAQ no longer says Docker is
+  required, the computer and security sections say how a local computer differs from a container (files kept to
+  its folder, commands off by default, no resource limits), and the roadmap marks computers without Docker as
+  shipped.
+
+### Fixed
+
+- Turning on commands for a local computer when the sandbox was missing or failed its self-check left the switch
+  off without saying why: the UI treated the gateway's 409 as "already done". The reason now shows in the panel.
+- A machine with no Chrome, Edge or Chromium could not download a browser for its local teammates: the
+  download failed at once with `ERR_PACKAGE_PATH_NOT_EXPORTED`, because playwright-core does not export its
+  `cli.js`. The gateway now finds the installer through the package's own folder.
+- The sign-in window of a local computer closed as soon as the teammate used its browser again, or a routine
+  fired — while the operator might be typing a password. It now closes only when the operator speaks again
+  (a message, a decision) or clicks *I'm done signing in*.
+- The panel's screen froze on the last frame after the browser was reopened for a sign-in; the stream now ends
+  and the panel reconnects to the new browser.
+- The screen viewer no longer retries forever (relaunching the browser each time) after the gateway says there
+  is no screen, and stops streaming while the tab is hidden.
+- The commands switch and the done button lock while the gateway works and show its refusal inline.
+- The shell tool and the briefing describe a local computer's working directory honestly (the folder is the
+  working directory and `$HOME`; `/workspace` is the file tools' name for it); `ask_for_login` tells the model to
+  stop and wait. The node the gateway runs on is first on a sandboxed command's PATH, so nvm-installed nodes work.
+- `running()` no longer counts a local computer whose browser the operator quit by hand.
+- Commands on a Linux local computer could never be turned on when a runtime manager (`~/.cargo/bin`, `~/.nvm`, …)
+  or the gateway's own folder sat in your home directory, which is the usual case: the sandbox self-check counted
+  bubblewrap's own mount points as a view of your home. It now ignores exactly the folders it binds back, and also
+  checks with a probe file it puts in your home and removes. Found by the new Linux CI job.
+- A gateway test that failed now and then on CI. It waits for two replies in a row, and `vi.waitFor` gave up at its
+  default of one second on a slow runner; gateway tests now wait up to three seconds, as the web tests already do.
+
+## [0.4.0] - 2026-10-30
+
+Teammates' computers without Docker: on macOS and Linux each teammate can get a browser and a folder of its
+own on your machine, with commands off by default and sandboxed when on — plus `@hono/node-server` 2 to clear a
+security advisory, WebSockets on its built-in support, and croner 11.
+
+### Security
+
+- The gateway runs on `@hono/node-server` 2.1.5, which clears GHSA-rmxm-3fg6-px4f (`serveStatic` decoding a
+  path twice). The gateway never used `serveStatic`, so it was not exploitable here, but no 1.x release fixes it.
+
+### Added
+
+- **Local computers — no Docker needed.** When Docker is not running (or `OPENGROKBOT_COMPUTERS=local`), each
+  teammate gets a browser of its own on your machine — your Chrome, Edge or Chromium, else a Chrome for Testing
+  downloaded once into the data dir (`OPENGROKBOT_BROWSER`, `OPENGROKBOT_BROWSER_MIRROR`) — with its own profile,
+  and a folder of its own that `read_file`/`write_file` cannot leave. The panel shows which kind of computer a
+  teammate has and streams a local browser's screen over CDP. `ask_for_login` reopens the browser as a real window
+  on the page the teammate was stuck on; *I'm done signing in* (or the next message) puts it back in the background.
+  macOS and Linux; Windows keeps Docker.
+- **Commands on a local computer, off by default.** Each teammate has a switch in its computer panel. On, commands
+  run under Seatbelt (macOS) or bubblewrap (Linux), confined to that teammate's folder and a private tmp, with the
+  data dir and your key folders unreadable; the switch refuses to turn on until the sandbox passes a self-check.
+  Off, the shell tool is not even offered to the model.
+- `pnpm --filter @opengrokbot/gateway run smoke:local` exercises a local computer against a real browser and the
+  real sandbox.
+
+### Changed
+
+- WebSockets — the live stream and each bot's screen — use node-server's built-in support instead of
+  `@hono/node-ws`, which only declares support for node-server 1.x. Upgrades still pass the gateway's token and
+  origin checks first, and screen frames are relayed byte for byte as before.
+- Routines are scheduled with croner 11. Around daylight-saving changes this follows cron's usual behaviour: a
+  routine set for a time that the clocks skip runs at the first valid time after the jump, and one that repeats
+  through the day keeps running through the repeated hour.
+
+## [0.3.1] - 2026-10-30
+
+Fixes from a second review of 0.3.0 — mostly webhooks: redeliveries that were dropped, signed requests that
+could be replayed, and bodies buffered before they were refused — plus a Node 26 bot image and steadier tests.
+
+### Security
+
+- A webhook delivery refused because the last run was still going is no longer remembered as "seen", so
+  GitHub's redelivery of it runs instead of being dropped as a duplicate.
+- A captured signed webhook request can no longer be replayed under a different (or no) delivery id: the
+  signature itself is remembered per routine.
+- Oversized webhook bodies are refused as they arrive instead of being buffered first, so a caller with a bad key
+  cannot make the gateway allocate the whole request.
+- A space-separated list of channels, handles or email addresses ("#ops #dev", "bob@acme.com alice@acme.com")
+  is treated as a list and never gets *Always allow*, as the changelog already promised.
+- The action log keeps query strings and fragments out of page addresses, and masks tokens, passwords and
+  authorization headers in logged commands.
+
+### Changed
+
+- The bot image is built on `node:26-bookworm-slim` (the current LTS line) instead of Node 22.
+- The bot image build gives apt 300 seconds per download and ten retries instead of the defaults, so
+  fetching Chromium over a slow mirror no longer fails the build.
+- CI runs on actions/checkout v7, actions/setup-node v7 and pnpm/action-setup v6, all on the Node 24 action runtime.
+
+### Fixed
+
+- A standing rule that differed only by case or trailing punctuation could be saved twice and then removed by
+  neither route; saving now dedupes the way removal compares, and the panel reports an ambiguous match as such.
+- Answering a question card twice at the same moment started two turns; the second now gets `409`.
+- Web: a reply that arrived while two thread loads overlapped (switching away and straight back) could vanish
+  until the next reconnect; a question card whose answer the gateway refused stayed on "Answered"; two timing-
+  dependent tests.
+- Web tests that failed now and then on a busy machine. The full-page App tests acted in the gap between the first
+  render and the effects that run after it, before the live connection existed or while a "close the panel on a
+  thread switch" effect was still queued; they now wait for both. A render test could also run past the 5-second
+  limit when the CPU was saturated, and its unfinished typing then leaked into the next test; web tests now get 15
+  seconds.
+
+## [0.3.0] - 2026-10-22
+
+Teammates you can leave work with: scoped standing approvals, presence on the roster, question cards, webhook
+and watch routines, batch approvals, shared skills and an action log — most of it borrowed from Grok Bot, Meta
+Muse and OpenAI dots — plus 40-step turns, Markdown replies and the security review that came with them.
+
+### Security
+
+- **GitHub can call a webhook routine without a key in the address.** Give GitHub the routine's address without
+  `?key=` and its key as the webhook *Secret*; the gateway checks the `X-Hub-Signature-256` signature against
+  the raw body. GitHub's setup `ping` is answered without waking anyone, a repeated delivery
+  (`X-GitHub-Delivery`) runs only once, and form-encoded deliveries are read too. *For GitHub* in the computer
+  panel copies the three settings.
+- **A webhook payload can no longer step outside its fence.** The lines around it carry the payload's own
+  SHA-256 fingerprint and every payload line starts with `│`, so a payload cannot write a closing line or pose
+  as your operator.
+- **Two long destinations can no longer share a rule.** Destinations used to be cut at 200 characters and
+  lower-cased whole, so two webhook URLs with the same first 200 characters, or two URLs whose paths differ
+  only in case, matched each other's rules. Now nothing is cut, URL paths keep their case, and a destination over
+  200 characters always asks. A rule saved earlier for a URL with capital letters in its path asks once more.
+- **Upgrades keep a way back.** Before the gateway upgrades an existing database's schema it writes a full copy
+  next to it (`opengrokbot.db.v<old>-before-v<new>.<time>.bak`, the three most recent are kept). If the copy
+  cannot be written it does not upgrade.
+
+### Added
+
+- **Watch routines.** "Keep an eye on the status page" creates a routine that only looks: each run gets
+  read-only tools (pages, files, skills, a report, a question, a hold), with no shell, typing, clicking,
+  handoffs or rule changes. A tool it was not given is refused even if the model asks for it. When nothing changed it
+  replies "Nothing new." and the gateway posts nothing. What a watch run holds always waits for you; a
+  standing rule never applies to it.
+- **Batch holds.** When one action goes to many recipients or records, the teammate holds it once with one
+  line per item. The chip lists them with checkboxes; untick any and approve the rest. The teammate is told
+  exactly which items were approved and which were left out, never to add one, and to stop at the first
+  failure. A batch never becomes a standing rule, and a bare 👍 approves all of it.
+- **Shared skills.** Markdown playbooks in `<data>/skills/*.md` are listed, by name and one line, in every
+  teammate's instructions; `read_skill` fetches one when the work calls for it. Only you write them — they live
+  outside every bot's computer. The computer panel lists them.
+- **Action log.** Every tool a teammate calls is recorded with what it acted on, whether it worked, how long it
+  took and what started the turn (you, a routine, a watch, a webhook, an approval, a handoff, the group or your
+  answer to a question), plus your approval decisions and every webhook call. Text typed into a page is never
+  logged, only the field. The computer panel shows the latest 30, `GET /api/bots/:id/actions` serves more, and
+  entries older than 90 days are dropped.
+- **Standing approvals.** An approval chip for an email, message or post to one destination now has
+  *Always allow…*: approve it and let that teammate send the same kind of thing to the same destination without
+  asking, for 1 hour, 24 hours or until you revoke it. The next matching hold goes straight through, marked
+  *Allowed by your rule*. Purchases, bookings and anything the bot does not classify always ask. The rules are
+  listed, with a revoke button, under *Allowed without asking* in the computer panel. Only your own signed-in
+  browser can create one; a bot cannot.
+  - The destination has to be one place: one email address, one channel or handle, one account, page or thread.
+    Wildcards, lists, "everyone" and a whole service such as "twitter" never get *Always allow*, and the chip
+    says why.
+  - A rule only lets a hold through in a turn you started: your message, your decision, your answer or your
+    question to the group, with no webhook payload in view. Work started by a routine, a webhook or a teammate's
+    handoff always asks, and the chip says which rule would have covered it.
+  - The teammate is never told which destinations a rule covers, so something it reads cannot steer it to one.
+- **Presence in the sidebar.** Each teammate's avatar shows whether it is working, waiting on you (an approval,
+  a question or a sign-in), stuck (its last turn errored, ran out of budget or hit a turn limit) or done — it
+  finished something while you were in another thread. A group row only shows that someone is working.
+- **Question cards.** A teammate can ask you to choose between two to six options (`ask_operator`); you tap one,
+  or tick several and submit, and it carries on. Open questions count in the sidebar badge and the tab title.
+  Typing a reply instead closes the card.
+- **Forgetting a rule.** Tell a teammate to drop a standing rule and it removes that line from `MEMORY.md`
+  (`forget_memory`), with a red diff chip. The computer panel lists every standing rule with a remove button,
+  which posts the same chip, so every change to a rule is still visible in the thread.
+- **Webhook routines.** A routine can start when another system calls it, instead of — or as well as — on a
+  schedule. Each one gets its own secret address (copy it from the computer panel); a `POST` with a body wakes
+  the teammate with that body attached as outside data. The body is posted into the thread as an *outside data*
+  card when the teammate picks it up, so you can see what set it off. The address works without the gateway
+  token, and the key never enters the thread or the model's context.
+
+- **Per-turn limits that fit real work.** A teammate can now take 40 model steps in one turn instead of 12
+  (`OPENGROKBOT_MAX_STEPS`), and a turn is paused after 20 minutes (`OPENGROKBOT_TURN_MINUTES`, `0` turns it
+  off; checked between steps). At either limit the teammate gets one last text-only call to say what it
+  finished, what is left and what it needs — instead of a bare "stopped" line. Say "continue" to pick it up.
+- **The computer panel opens at once.** While a sleeping computer wakes up (10–20 seconds) the panel shows what
+  it is waiting for and for how long. If you move to another teammate meanwhile, the late answer no longer
+  reopens the old panel.
+- **Teammate replies render as Markdown**: tables, lists, code, quotes and links (which open in a new tab).
+  Images are shown as a placeholder and never loaded, and raw HTML from the model is dropped. A single newline
+  stays a line break, so a dispatch table keeps one item per line. What you type is still shown as typed.
+- **Day dividers and time stamps** in every thread: a time on the first message of the day and after any pause
+  longer than five minutes.
+- **Versioned database schema.** The schema version lives in SQLite's `user_version` and migrations run on
+  start, one step per transaction. A v0.2 database is adopted in place; one written by a newer gateway is
+  refused with a clear message instead of being half-upgraded.
+- **Dependency audit in CI** (`pnpm audit --audit-level high`) and Dependabot for npm, GitHub Actions and the
+  bot image's base.
+
+### Changed
+
+- `hold_for_approval` takes a `kind` (email, message, post, purchase, booking, other) and an exact `target`.
+  Holds from older prompts without them count as "other", so they always ask.
+- The database schema moves to v2 and then v3 on start (approval kinds and targets, a rules table, routine webhook
+  keys; routine modes, batch items, the action log).
+- A teammate is marked *done* in the sidebar only when it said something while you were elsewhere, so a quiet
+  watch run does not flag it.
+- The live stream's `status` events carry `waiting` and `blocked` as well as `thinking` and `idle`.
+- Node 22 is pinned: `engines` in the manifests and `.nvmrc`, which CI reads.
+- Dependencies bumped within their existing ranges (hono 4.13.13, vite 8.3.5, vitest 4.1.12, playwright-core
+  1.64.1, react 19.3.1 and their transitives). The audit against the public registry went from 24 advisories
+  (6 high) to none.
+- `pnpm test` runs the gateway and web suites one after the other instead of side by side.
+
+### Fixed
+
+- Three timing-dependent tests that failed intermittently on CI: the order of parallel group replies, queued
+  messages being answered in one turn, and the panel closing on a thread switch.
+
+## [0.2.1] - 2026-09-28
+
+Lock down, cage and harden the self-built core.
+
+### Security
+
+- **Token sign-in.** The gateway listens on `127.0.0.1` by default and needs a token kept in the data dir
+  (`0600`, never in a bot's workspace). The startup link sets an `HttpOnly`, `SameSite=Strict` cookie; scripts
+  send a bearer token. State changes and the WebSocket must come from the gateway's own origin, and requests
+  with a body must be JSON.
+- **Caged computers.** All bot containers share one network with container-to-container traffic off, and get
+  memory, CPU and process limits, `no-new-privileges` and an init process. Each container has its own secrets
+  for the shell/file shim, the browser control port (CDP) and the VNC screen, because on Docker Desktop a
+  container can still reach ports published on the host.
+- **Screens are served by the gateway** from its own copy of noVNC; only the raw VNC stream comes from the
+  bot's computer, so nothing a bot changes inside its container reaches your browser as a page.
+- **Rules and evidence left the workspace.** `MEMORY.md` and screenshots moved out of the bind-mounted
+  workspace (migrated once at startup), so a bot cannot rewrite its standing rules or its evidence.
+
+### Added
+
+- One turn at a time per teammate. Messages you send while it is busy show at once and are answered together
+  next; a follow-up is the last thing the model reads.
+- A stop button that ends the turn, including a shell command in flight (its whole process group is killed);
+  no command runs longer than ten minutes.
+- Routines run with the same tools as chat, never overlap, and can be paused, resumed, deleted or run now from
+  the computer panel; teammates can `stop_routine`.
+- LLM timeouts, retries with backoff and `Retry-After`, usage accounting and an optional per-teammate daily
+  token budget (`OPENGROKBOT_DAILY_TOKENS`); optional vision (`OPENGROKBOT_VISION`).
+- `AGENTS.md`, the operating manual with the hard boundaries, is part of the prompt. Role and emoji live in
+  `SOUL.md` frontmatter; teammates with non-Latin names can be hired.
+- Richer browser tools: press, scroll, back, the page's links, the newest tab, paged reading of long pages and
+  files, head-and-tail shell output.
+- A live activity card for each turn's computer steps, needs-you badges and a count in the tab title, a
+  sign-in screen, an IME-safe composer, and catch-up after a reconnect.
+- `pnpm build && pnpm start` serves the built UI, API, stream and screens on one port; launchd and systemd
+  templates; security, always-on and multi-bot guides; CI.
+
+### Fixed
+
+- A failed first CDP connection no longer breaks a computer's browser for good; a restarted Chromium is
+  reconnected and the container supervises its processes.
+- Changing memory, CPU or timezone settings rebuilds the computers; containers are owned by label, so Docker
+  Desktop's mount paths no longer trigger rebuilds, and a relative data dir works.
+- The idle sweep and a new turn no longer race, and an open screen counts as use.
+- Operator decisions no longer reach the model as empty user messages, which strict providers reject.
+
+## [0.2.0] - 2026-08-13
+
+The self-built core: OpenGrokBot stops being an OpenClaw distribution and gets its own gateway, web client and
+one computer per teammate.
+
+### Added
+
+- A gateway (Hono, SQLite, WebSocket) and a web client: the sidebar as org chart, threads, the report chip.
+- A Docker computer per teammate: Xvfb, headed Chromium driven over CDP, a VNC screen, a shell/file shim and a
+  persistent workspace whose browser logins survive restarts.
+- Computer tools — shell, files, browser — and screenshots posted into the thread as evidence.
+- Draft-and-hold approvals with idempotent decisions and a bare 👍 to release; standing rules in `MEMORY.md`
+  with a diff chip; routines from the conversation with cron in plain English.
+- Group threads where members answer in parallel and the chief of staff closes with a dispatch table;
+  allowlisted `message_bot` handoffs capped at two hops.
+- Takeover login (`ask_for_login` and the computer panel) and hiring from the sidebar with a name and one line.
+- Any OpenAI-compatible model, plus a scripted `stub` model that runs everything offline.
+- The dark workbench skin.
+
+### Changed
+
+- The v0.1 OpenClaw setup moved to [docs/openclaw-recipe](docs/openclaw-recipe/README.md) as a reference.
+
+## [0.1.0] - 2026-08-12
+
+A self-hosted Grok Bot alternative assembled from OpenClaw: three preconfigured teammates (Scout, Sorter,
+Ticker) with strict boundaries, agent-to-agent handoffs, any model provider, a one-command setup that never
+overwrites an existing OpenClaw config, a Docker/VPS path and an honest comparison with Grok Bot.
+
+[Unreleased]: https://github.com/wolfqing/OpenSuperBot/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/wolfqing/OpenSuperBot/compare/v0.4.0...v0.5.0
+[0.4.0]: https://github.com/wolfqing/OpenSuperBot/compare/v0.3.1...v0.4.0
+[0.3.1]: https://github.com/wolfqing/OpenSuperBot/compare/v0.3.0...v0.3.1
+[0.3.0]: https://github.com/wolfqing/OpenSuperBot/compare/v0.2.1...v0.3.0
+[0.2.1]: https://github.com/wolfqing/OpenSuperBot/compare/v0.2.0...v0.2.1
+[0.2.0]: https://github.com/wolfqing/OpenSuperBot/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/wolfqing/OpenSuperBot/releases/tag/v0.1.0

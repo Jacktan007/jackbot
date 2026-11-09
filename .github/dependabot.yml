@@ -1,0 +1,23 @@
+# 每周一批：小版本和补丁合成一个 PR，大版本单独来；镜像基底和 Actions 也一起盯着。
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      minor-and-patch:
+        update-types: [minor, patch]
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+  - package-ecosystem: docker
+    directory: /docker/bot
+    schedule:
+      interval: weekly
+    # 只跟 Node 的偶数主版本（LTS 线）：奇数版半年就停更，2026-10 Dependabot 曾把 #6 从 26 改成 25。
+    # 范围写法走 Gem::Requirement（docker 生态的比较器），"25.x" 那种写法它不认。
+    ignore:
+      - dependency-name: node
+        versions: [">= 25, < 26", ">= 27, < 28", ">= 29, < 30", ">= 31, < 32"]

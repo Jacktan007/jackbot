@@ -1,0 +1,26 @@
+{
+  "name": "jackbot",
+  "private": true,
+  "packageManager": "pnpm@10.33.2",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "dev": "pnpm --parallel --filter @jackbot/gateway --filter @jackbot/web dev",
+    "build": "pnpm --filter @jackbot/web build && pnpm --filter @jackbot/gateway build",
+    "start": "pnpm --filter @jackbot/gateway start",
+    "typecheck": "pnpm -r typecheck",
+    "test": "pnpm -r --workspace-concurrency=1 test"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild"
+    ],
+    "ignoredBuiltDependencies": [
+      "better-sqlite3",
+      "cpu-features",
+      "protobufjs",
+      "ssh2"
+    ]
+  }
+}
