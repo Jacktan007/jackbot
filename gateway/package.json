@@ -12,7 +12,8 @@
     "typecheck": "tsc --noEmit -p .",
     "test": "vitest run",
     "smoke:docker": "tsx scripts/smoke-docker.ts",
-    "smoke:local": "tsx scripts/smoke-local.ts"
+    "smoke:local": "tsx scripts/smoke-local.ts",
+    "smoke:start": "tsx scripts/smoke-start.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^1.6.0",

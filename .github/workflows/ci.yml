@@ -2,8 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, 'cut-*']
   pull_request:
+  workflow_dispatch:
 
 jobs:
   test:
@@ -24,6 +25,8 @@ jobs:
       - run: pnpm typecheck
       - run: pnpm test
       - run: pnpm build
+      - name: Start smoke (built gateway and web UI)
+        run: pnpm --filter @jackbot/gateway run smoke:start
       - name: Windows start-up scripts parse, install and uninstall
         if: runner.os == 'Windows'
         shell: pwsh
