@@ -49,6 +49,9 @@ const db = openDb(startup.dbPath, {
 // 模型和看图每次现读（改了下一次调用就生效），浏览器镜像下载前现读；电脑种类只在这里读一次，改了要重启
 const live = () => currentConfig(startup, process.env, db)
 const config = live()
+if (config.model !== 'stub' && !config.apiKey.trim()) {
+  console.warn('[jackbot] no model key yet. Set JACKBOT_API_KEY, or start with JACKBOT_MODEL=stub for the offline model. OPENSUPERBOT_API_KEY still works when JACKBOT_API_KEY is unset.')
+}
 // 预置样板来自版本库，用户新雇的同事住在数据目录
 const bots = [
   ...seedTeammates(db, config.teammatesDir),

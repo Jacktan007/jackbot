@@ -1,10 +1,11 @@
+import { mkdirSync, writeFileSync } from 'node:fs'
 import { mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, posix, win32 } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { createLocalBackend } from '../src/backend.js'
 import type { BrowserLike, CdpSessionLike, PageLike } from '../src/browser-page.js'
-import { createLocalComputer, workspacePath, type LocalLaunch } from '../src/computer-local.js'
+import { chromiumLaunchArgs, createLocalComputer, resolveBrowserExecutable, workspacePath, type LocalLaunch } from '../src/computer-local.js'
 
 let dir: string
 beforeEach(async () => { dir = await realpath(await mkdtemp(join(tmpdir(), 'osb-local-'))) })
@@ -29,6 +30,30 @@ function fakeBrowser() {
   const launch: LocalLaunch = async (opts) => { state.launches.push(opts); state.open = true; return browser }
   return { state, launch }
 }
+
+describe('browser launch on a cloud VM', () => {
+  it('uses the real chrome binary next to the shell wrapper', () => {
+    const root = join(dir, 'chrome-dist')
+    mkdirSync(root)
+    writeFileSync(join(root, 'google-chrome'), '#!/bin/bash\nexit 0\n')
+    writeFileSync(join(root, 'chrome'), 'binary')
+    expect(resolveBrowserExecutable(join(root, 'google-chrome'))).toBe(join(root, 'chrome'))
+    expect(resolveBrowserExecutable(join(root, 'chrome'))).toBe(join(root, 'chrome'))
+    expect(resolveBrowserExecutable(join(dir, 'does-not-exist'))).toBe(join(dir, 'does-not-exist'))
+  })
+
+  it('adds the flags a container needs, and disables the GPU only when headless', () => {
+    expect(chromiumLaunchArgs(true)).toEqual(['--hide-crash-restore-bubble', '--disable-dev-shm-usage', '--no-sandbox', '--disable-gpu'])
+    expect(chromiumLaunchArgs(false)).toEqual(['--hide-crash-restore-bubble', '--disable-dev-shm-usage', '--no-sandbox'])
+  })
+
+  it('reports a missing browser immediately instead of hanging', async () => {
+    const computer = createLocalComputer({
+      workspaceDir: dir, profileDir: join(dir, 'profile'), executablePath: join(dir, 'missing-chrome'),
+    })
+    await expect(computer.goto('https://example.com')).rejects.toThrow(/Could not start the teammate browser.*within 20s/)
+  })
+})
 
 describe('workspacePath', () => {
   // 这组用 POSIX 的规则，在哪个系统上跑结果都一样；Windows 的规则在下一组

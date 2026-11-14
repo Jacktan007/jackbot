@@ -16,6 +16,25 @@ This is the closest open build in this repo to the xAI / Cursor Grok Bot shape. 
 
 Licenses: [LICENSE](LICENSE) and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
+## Quick start
+
+You need Node.js 22+ and pnpm 10.
+
+1. `pnpm install`
+2. Offline, no key: `JACKBOT_MODEL=stub pnpm dev`
+3. Open the sign-in URL the terminal prints. The UI is <http://127.0.0.1:47821> and the gateway is <http://127.0.0.1:4747>. Without that link, `/api/session` is 401. The token file is `gateway/data/auth-token`.
+
+A real model needs a key. If you start without `JACKBOT_MODEL=stub` and without a key, the gateway prints that and still boots, but turns cannot call a model:
+
+```bash
+export JACKBOT_API_KEY="your key"
+export JACKBOT_API_BASE="https://api.x.ai/v1"   # or http://localhost:11434/v1
+export JACKBOT_MODEL="grok-4.7"
+pnpm dev
+```
+
+`JACKBOT_*` wins. A blank value does not hide `OPENSUPERBOT_*` or `OPENGROKBOT_*`.
+
 ## Run it
 
 Node.js 22 or newer, and pnpm 10.

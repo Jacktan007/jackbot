@@ -16,6 +16,25 @@ jackbot 是一个网关、一套线程界面，以及每位同事一台电脑：
 
 许可：[LICENSE](LICENSE)、[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 
+## 快速开始
+
+需要 Node.js 22+ 和 pnpm 10。
+
+1. `pnpm install`
+2. 不配 key、离线跑：`JACKBOT_MODEL=stub pnpm dev`
+3. 打开终端里那条登录链接。界面是 <http://127.0.0.1:47821>，网关是 <http://127.0.0.1:4747>。没有这条链接时 `/api/session` 是 401。令牌文件是 `gateway/data/auth-token`。
+
+要用真实模型，先设 key。没设 `JACKBOT_MODEL=stub` 也没设 key 时，网关会提示并照常启动，但回合打不到模型：
+
+```bash
+export JACKBOT_API_KEY="你的 key"
+export JACKBOT_API_BASE="https://api.x.ai/v1"   # 或 http://localhost:11434/v1
+export JACKBOT_MODEL="grok-4.7"
+pnpm dev
+```
+
+`JACKBOT_*` 优先。空白不会盖住 `OPENSUPERBOT_*` 和 `OPENGROKBOT_*`。
+
 ## 跑起来
 
 需要 Node.js 22+ 和 pnpm 10。

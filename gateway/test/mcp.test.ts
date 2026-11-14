@@ -257,6 +257,23 @@ describe('mcp fixture', () => {
   })
 })
 
+describe('mcp start failures', () => {
+  it('names a missing command and retries once', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'jackbot-missing-'))
+    const host = createMcpHost(dir)
+    hosts.push(host)
+    const command = join(dir, 'missing-bin')
+    expect(await host.upsert({ name: 'gone', command, args: [], env: {}, enabled: true, bots: [] })).toEqual({ ok: true })
+    const started = Date.now()
+    expect(await host.toolDefs({ botId: 'researcher', watch: false })).toEqual([])
+    const status = await host.statuses()
+    expect(status.servers[0]).toMatchObject({ name: 'gone', state: 'error' })
+    expect(status.servers[0]?.error).toMatch(/not found/)
+    expect(status.servers[0]?.error).toMatch(/Tried twice/)
+    expect(Date.now() - started).toBeLessThan(8_000)
+  })
+})
+
 describe('mcp http', () => {
   it('keeps connectors behind the session and does not start a preset just by saving it', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'jackbot-api-'))

@@ -328,8 +328,23 @@ class McpConnection {
     if (this.state === 'starting' && this.starting) return this.starting
     this.state = 'starting'
     this.error = undefined
-    this.starting = this.doStart()
+    this.starting = this.startWithRetry()
     return this.starting
+  }
+
+  private async startWithRetry(): Promise<void> {
+    await this.doStart()
+    if (this.state !== 'error') return
+    const first = this.error ?? 'unknown error'
+    if (!/timed out|exited|ENOENT|ECONNRESET|not found|EPIPE/i.test(first)) return
+    this.state = 'starting'
+    this.error = undefined
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    if (this.state === 'stopped') return
+    await this.doStart()
+    if (this.state === 'error' && this.error) {
+      this.error = `${this.error} Tried twice. First attempt: ${first}`
+    }
   }
 
   private async doStart(): Promise<void> {
@@ -363,7 +378,7 @@ class McpConnection {
     this.proc = proc
     proc.on('error', (err) => this.failStart(err.message))
     proc.on('exit', (code) => {
-      if (this.state === 'stopped' || this.state === 'error') return
+      if (this.proc !== proc || this.state === 'stopped' || this.state === 'error') return
       this.failStart(`server exited (code ${code ?? '?'})${this.stderrTail ? `: ${this.secrets.mask(this.stderrTail)}` : ''}`)
     })
     proc.stderr.setEncoding('utf8')
@@ -394,7 +409,12 @@ class McpConnection {
 
   private failStart(message: string): void {
     this.state = 'error'
-    this.error = this.secrets.mask(message)
+    const cmd = [this.config.command, ...this.config.args].join(' ')
+    const missing = /ENOENT|not found/i.test(message)
+    const hint = missing
+      ? ' The command was not found. Install it or fix the path, then Restart.'
+      : ' Check the command, arguments, and ${secret:} values, then Restart.'
+    this.error = this.secrets.mask(`Connector "${this.config.name}" failed (${cmd}): ${message}.${hint}`)
     this.failAll(new Error(this.error))
     this.kill()
   }

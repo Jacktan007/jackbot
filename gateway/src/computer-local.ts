@@ -1,4 +1,4 @@
-import { constants } from 'node:fs'
+import { constants, existsSync, readFileSync, realpathSync } from 'node:fs'
 import { mkdir, open, readFile, realpath, stat } from 'node:fs/promises'
 import nodePath, { dirname, join, relative, sep } from 'node:path'
 import { chromium } from 'playwright-core'
@@ -95,13 +95,44 @@ async function confined(workspaceDir: string, given: string): Promise<string> {
   }
 }
 
+/** 云主机和容器里，google-chrome 往往是一层 shell 包装，Playwright 等它的管道会一直卡住。旁边的 chrome 才是二进制。 */
+export function resolveBrowserExecutable(executablePath: string): string {
+  try {
+    const real = realpathSync(executablePath)
+    const binary = join(dirname(real), 'chrome')
+    if (binary !== real && existsSync(binary)) {
+      const head = readFileSync(real).subarray(0, 2).toString('utf8')
+      if (head === '#!') return binary
+    }
+  } catch {
+    // 路径不存在就原样交回去，让启动时报清楚。
+  }
+  return executablePath
+}
+
+/** headless 在没有用户命名空间的 VM 上不开 --no-sandbox 会起不来；/dev/shm 太小也会挂。 */
+export function chromiumLaunchArgs(headless: boolean): string[] {
+  const args = ['--hide-crash-restore-bubble', '--disable-dev-shm-usage', '--no-sandbox']
+  if (headless) args.push('--disable-gpu')
+  return args
+}
+
+export const BROWSER_LAUNCH_TIMEOUT_MS = 20_000
+
 const defaultLaunch: LocalLaunch = async ({ profileDir, executablePath, headless }) => {
+  const executable = resolveBrowserExecutable(executablePath)
   const context = await chromium.launchPersistentContext(profileDir, {
-    executablePath,
+    executablePath: executable,
     headless,
+    timeout: BROWSER_LAUNCH_TIMEOUT_MS,
     viewport: { width: 1280, height: 800 },
-    // 上次没正常退出时 Chrome 会弹「恢复页面？」挡住屏幕
-    args: ['--hide-crash-restore-bubble'],
+    args: chromiumLaunchArgs(headless),
+  }).catch((err: unknown) => {
+    const detail = err instanceof Error ? err.message : String(err)
+    throw new Error(
+      `Could not start the teammate browser (${executable}${headless ? ', headless' : ''}) within ${BROWSER_LAUNCH_TIMEOUT_MS / 1000}s. ${detail} `
+      + 'On a cloud VM, point JACKBOT_BROWSER at the Chrome binary (for example /opt/google/chrome/chrome). The google-chrome shell wrapper can hang forever.',
+    )
   })
   let open = true
   context.on('close', () => { open = false })
