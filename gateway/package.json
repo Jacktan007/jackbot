@@ -15,15 +15,15 @@
     "smoke:local": "tsx scripts/smoke-local.ts"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^1.6.0",
+    "@anthropic-ai/sdk": "^1.8.0",
     "@hono/node-server": "^2.1.6",
     "@novnc/novnc": "1.7.0",
     "better-sqlite3": "^13.0.3",
     "croner": "^11.0.0",
     "dockerode": "^5.0.1",
-    "hono": "^4.13.16",
-    "playwright-core": "^1.64.1",
-    "ws": "^8.22.1"
+    "hono": "^4.13.17",
+    "playwright-core": "^1.65.0",
+    "ws": "^8.22.2"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^9.6.0",
@@ -32,6 +32,6 @@
     "@types/ws": "^8.18.2",
     "tsx": "^4.23.15",
     "typescript": "^7.0.2",
-    "vitest": "^5.0.5"
+    "vitest": "^5.1.0"
   }
 }
