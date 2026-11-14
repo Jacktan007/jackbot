@@ -14,7 +14,7 @@ jackbot 是一个网关、一套线程界面，以及每位同事一台电脑：
 | --- | --- | --- |
 | 网关、网页、每人一台电脑、审批、记忆、例行任务 | [wolfqing/OpenSuperBot](https://github.com/wolfqing/OpenSuperBot)（MIT），2026 年 11 月前叫 OpenGrokBot | 整个产品，这是底座 |
 | stdio MCP 客户端、`${secret:}` 密钥库、Playwright 与 Chrome DevTools 预设 | [nickylin/OpenGrokBot](https://github.com/nickylin/OpenGrokBot)（MIT） | 客户端和这两个预设，做进网关。不带那个项目的 CLI 套件 |
-| 其余 stdio 预设 | [Z4YT0N/OpenGrokBot](https://github.com/Z4YT0N/OpenGrokBot) 的市场列表（MIT） | GitHub、文件系统、记忆图、逐步思考、Context7、Slack、Notion。不带 CLI 员工，也没有 HTTP MCP |
+| 其余 stdio 预设 | [Z4YT0N/OpenGrokBot](https://github.com/Z4YT0N/OpenGrokBot) 的市场列表（MIT） | GitHub、文件系统、记忆图、逐步思考、Context7、Slack、Notion。不带 CLI 员工，也不包含它的 HTTP MCP 预设 |
 
 许可：[LICENSE](LICENSE)、[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 
@@ -95,7 +95,7 @@ Docker 电脑的镜像仍是 `opensuperbot/bot:dev`，容器名是 `opensuperbot
                               │    shell、文件、browser_goto / extract / click / screenshot
                               │
                               └─ MCP 服务器，跑在网关这台机器上
-                                   stdio JSON-RPC，工具名 mcp_<服务器>_<工具>
+                                   stdio JSON-RPC 或 Streamable HTTP，工具名 mcp_<服务器>_<工具>
 ```
 
 网关是 Hono + SQLite（`@jackbot/gateway`）。界面是 React + Vite（`@jackbot/web`）。一轮对话先放上这位同事自己的工具，再附上他能用的 MCP 工具。watch 例行任务只有电脑上的只读工具。
@@ -111,7 +111,7 @@ MCP 由启动网关的用户在宿主机上拉起，不在同事的容器里。�
 - 文件系统。默认是数据目录下的空文件夹，不是某位同事的工作区。
 - 记忆图、逐步思考、Context7。
 
-自定义服务器填名字、命令、参数，以及一行一个 `KEY=value`。可以限定同事 id，留空就是每位同事都能用。
+对话框里的自定义服务器填名字、命令、参数，以及一行一个 `KEY=value`。可以限定同事 id，留空就是每位同事都能用。也支持在 `<data>/mcp.json` 或通过 `POST /api/mcp/servers` 配置 Streamable HTTP 服务器（填写 `http://` 或 `https://` 的 `"url"`）：网关通过 `POST` 发送 JSON-RPC（`Accept: application/json, text/event-stream`），支持 JSON 和 SSE `data:` 响应、跟踪 `mcp-session-id`，并在 `url` 及键名符合 `[A-Za-z_][A-Za-z0-9_]*` 的 `env` 请求头（例如 `Authorization`）中替换 `${secret:name}`。保存后的 HTTP 服务器会显示在连接器列表中，支持重启和删除。
 
 密钥在 `<data>/secrets.json`（系统允许时是 `0600`）。接口只返回名字。工具原文里出现长度不少于 4 的密钥时，模型看到之前会被打码。子进程不会继承名字里像 key、token 的环境变量。
 
@@ -128,15 +128,15 @@ pnpm typecheck
 pnpm test
 ```
 
-网关测试是 vitest。网页测试是 vitest + jsdom。`gateway/test/mcp.test.ts` 覆盖策略、fixture 进程、审批门，以及保存 Playwright 预设之后 `browser_goto` 还在、并且不会去拉起 `npx`。
+网关测试是 vitest。网页测试是 vitest + jsdom。`gateway/test/mcp.test.ts` 覆盖策略、fixture 进程、Streamable HTTP（JSON、SSE、`mcp-session-id`、请求头与密钥替换、对外审批）、审批门，以及保存 Playwright 预设之后 `browser_goto` 还在、并且不会去拉起 `npx`。
 
 ## 缺口
 
 长的一版在 [docs/grok-bot-parity.md](docs/grok-bot-parity.md)。短的：
 
-- 没有 iOS，没有手把手演示回放，没有 HTTP MCP。
+- 没有 iOS，没有手把手演示回放，没有 MCP OAuth 或 HTTP 预设（Streamable HTTP 可通过 `mcp.json` 里的 `url` 或 `POST /api/mcp/servers` 使用；老式 `GET /sse` 传输和界面表单里的 `url` 输入框暂未提供）。
 - MCP 不在同事的容器里。
 - Playwright MCP 不替换内置浏览器。
 - shell 和内置浏览器的对外动作，仍然靠模型去调 `hold_for_approval`。MCP 的对外工具由网关拦住。
-- 只接受 Content-Length 请求的服务器不支持。响应可以是换行 JSON，也可以是 Content-Length。
+- 只接受 Content-Length 请求的 stdio 服务器不支持。stdio 响应可以是换行 JSON，也可以是 Content-Length。
 - 工作流文件的 id 仍是 `opensuperbot.workflow`。容器和镜像名仍是 `opensuperbot`，这样已有的电脑可以原地升级。

@@ -14,7 +14,7 @@ This is the closest open build in this repo to the xAI / Cursor Grok Bot shape. 
 | --- | --- | --- |
 | Gateway, web UI, per-teammate computer, approvals, memory, routines | [wolfqing/OpenSuperBot](https://github.com/wolfqing/OpenSuperBot) (MIT), formerly OpenGrokBot | The whole product. This is the base. |
 | Stdio MCP client, `${secret:}` vault, Playwright and Chrome DevTools presets | [nickylin/OpenGrokBot](https://github.com/nickylin/OpenGrokBot) (MIT) | The client and those presets, reimplemented in the gateway. Not that app's CLI harnesses. |
-| Extra stdio presets | [Z4YT0N/OpenGrokBot](https://github.com/Z4YT0N/OpenGrokBot) marketplace (MIT) | GitHub, filesystem, memory graph, sequential thinking, Context7, Slack, Notion. Not the CLI employees, and not HTTP MCP. |
+| Extra stdio presets | [Z4YT0N/OpenGrokBot](https://github.com/Z4YT0N/OpenGrokBot) marketplace (MIT) | GitHub, filesystem, memory graph, sequential thinking, Context7, Slack, Notion. Not the CLI employees, and not its HTTP MCP presets. |
 
 Licenses: [LICENSE](LICENSE) and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
@@ -95,7 +95,7 @@ browser  →  Vite UI :47821  →  gateway :4747  →  model (your key, or stub)
                                   │    shell, files, browser_goto / extract / click / screenshot
                                   │
                                   └─ MCP servers on the gateway machine
-                                       stdio JSON-RPC, tools mcp_<server>_<tool>
+                                       stdio JSON-RPC or Streamable HTTP, tools mcp_<server>_<tool>
 ```
 
 The gateway is Hono and SQLite (`@jackbot/gateway`). The UI is React and Vite (`@jackbot/web`). A turn builds the teammate's own tools first, then appends MCP tools for that teammate. Watch routines only receive the computer's read-only tools.
@@ -111,7 +111,7 @@ Open **MCP** in the sidebar (the button appears when `/api/mcp` is available). P
 - Filesystem, defaulting to an empty folder under the data dir, not a teammate workspace.
 - Memory graph, sequential thinking, Context7.
 
-A custom server is a name, a command, arguments, and `KEY=value` environment lines. Restrict it to teammate ids or leave that blank for everyone.
+A custom server in the dialog is a name, a command, arguments, and `KEY=value` environment lines. Restrict it to teammate ids or leave that blank for everyone. Streamable HTTP servers (`"url"` with `http://` or `https://`) can also be configured in `<data>/mcp.json` or via `POST /api/mcp/servers`: the gateway sends `POST` JSON-RPC (`Accept: application/json, text/event-stream`), reads JSON or SSE `data:` responses, tracks `mcp-session-id`, and substitutes `${secret:name}` in `url` and `env` request headers whose keys match `[A-Za-z_][A-Za-z0-9_]*` (such as `Authorization`). Saved HTTP servers appear in the Connectors list with Restart and Delete.
 
 Secrets live in `<data>/secrets.json` (mode `0600` where the OS allows). The API lists names only. Tool text that contains a secret of 4+ characters is masked before the model sees it. Child processes do not inherit environment variables whose names look like keys or tokens.
 
@@ -128,15 +128,15 @@ pnpm typecheck
 pnpm test
 ```
 
-Gateway tests are vitest. Web tests are vitest and jsdom. `gateway/test/mcp.test.ts` covers the policy, the fixture process, the approval gate, and that saving the Playwright preset leaves `browser_goto` in place and does not spawn `npx`.
+Gateway tests are vitest. Web tests are vitest and jsdom. `gateway/test/mcp.test.ts` covers the policy, the fixture process, Streamable HTTP (JSON, SSE, `mcp-session-id`, headers/secrets, and outward approvals), the approval gate, and that saving the Playwright preset leaves `browser_goto` in place and does not spawn `npx`.
 
 ## Gaps
 
 The short list, with the longer one in [docs/grok-bot-parity.md](docs/grok-bot-parity.md):
 
-- No iOS app, no teach-by-demo replay, no HTTP MCP.
+- No iOS app, no teach-by-demo replay, no MCP OAuth or HTTP presets (Streamable HTTP works via `url` in `mcp.json` or `POST /api/mcp/servers`; legacy `GET /sse` and a `url` field in the dialog form are not built).
 - MCP is not inside the teammate container.
 - Playwright MCP does not replace the built-in browser.
 - Shell and the built-in browser still rely on the model calling `hold_for_approval` before an outward action. MCP outward tools are gated in the gateway.
-- Servers that only accept Content-Length requests are not supported. Responses may be newline JSON or Content-Length.
+- Stdio servers that only accept Content-Length requests are not supported. Stdio responses may be newline JSON or Content-Length.
 - Workflow files keep the id `opensuperbot.workflow`. Container and image names stay `opensuperbot` so existing computers upgrade in place.
