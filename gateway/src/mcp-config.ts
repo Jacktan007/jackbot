@@ -10,6 +10,8 @@ export type McpServerConfig = {
   enabled: boolean
   /** Empty means every teammate. */
   bots: string[]
+  /** Streamable HTTP endpoint. When set, the server is not a stdio process. */
+  url?: string
 }
 
 const NAME_RE = /^[a-zA-Z][a-zA-Z0-9_-]{0,32}$/
@@ -47,8 +49,22 @@ export function parseServer(input: unknown): { server: McpServerConfig } | { err
   const rec = (input ?? {}) as Record<string, unknown>
   const name = typeof rec.name === 'string' ? rec.name.trim() : ''
   const command = typeof rec.command === 'string' ? rec.command.trim() : ''
+  const urlRaw = typeof rec.url === 'string' ? rec.url.trim() : ''
   if (!NAME_RE.test(name)) return { error: `invalid MCP server name "${name}"` }
-  if (!command || command.length > 300 || /[\u0000-\u001f]/.test(command)) return { error: `${name}: command is missing or invalid` }
+  let url: string | undefined
+  if (urlRaw) {
+    if (urlRaw.length > 2000 || /[\u0000-\u001f]/.test(urlRaw)) return { error: `${name}: url is invalid` }
+    try {
+      const parsed = new URL(urlRaw)
+      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return { error: `${name}: url must be http or https` }
+    } catch {
+      return { error: `${name}: url is not a valid URL` }
+    }
+    url = urlRaw
+  } else if (!command || command.length > 300 || /[\u0000-\u001f]/.test(command)) {
+    return { error: `${name}: command is missing or invalid` }
+  }
+  if (command && (command.length > 300 || /[\u0000-\u001f]/.test(command))) return { error: `${name}: command is missing or invalid` }
   const argsIn = Array.isArray(rec.args) ? rec.args : []
   if (argsIn.length > 40) return { error: `${name}: too many args` }
   const args: string[] = []
@@ -84,6 +100,7 @@ export function parseServer(input: unknown): { server: McpServerConfig } | { err
       env,
       enabled: rec.enabled !== false,
       bots,
+      ...(url ? { url } : {}),
     },
   }
 }

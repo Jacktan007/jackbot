@@ -5,6 +5,7 @@ import { feedMcpStream, type McpFrame } from './mcp-frames.js'
 import { loadMcpConfig, parseServer, saveMcpConfig, type McpServerConfig } from './mcp-config.js'
 import { mcpPresets, presetConfig, type McpPreset } from './mcp-catalog.js'
 import { mcpToolAccess } from './mcp-policy.js'
+import { createMcpHttpSession, type McpHttpSession } from './mcp-http.js'
 import { createSecretStore, type SecretStore } from './secrets.js'
 import type { ToolDef } from './llm.js'
 
@@ -190,7 +191,7 @@ export function createMcpHost(dataDir: string): McpHost {
       return {
         servers: [...servers.values()].map((managed) => ({
           name: managed.config.name,
-          command: [managed.config.command, ...managed.config.args].join(' '),
+          command: managed.config.url ?? [managed.config.command, ...managed.config.args].join(' '),
           enabled: managed.config.enabled !== false,
           state: managed.conn.state,
           toolCount: managed.conn.tools.length,
@@ -312,6 +313,7 @@ class McpConnection {
   state: 'stopped' | 'starting' | 'ready' | 'error' = 'stopped'
   error?: string
   tools: ListedTool[] = []
+  private http?: McpHttpSession
   private proc?: ChildProcessWithoutNullStreams
   private pending = new Map<number, { resolve: (value: unknown) => void; reject: (err: Error) => void; timer: NodeJS.Timeout }>()
   private nextId = 1
@@ -348,6 +350,38 @@ class McpConnection {
   }
 
   private async doStart(): Promise<void> {
+    if (this.config.url) {
+      const substituted = this.secrets.substitute(this.config.url)
+      if (!substituted.ok) {
+        this.failStart(`missing secret in url: ${substituted.missing.join(', ')}`)
+        return
+      }
+      const headers: Record<string, string> = {}
+      for (const [key, raw] of Object.entries(this.config.env)) {
+        const header = this.secrets.substitute(raw)
+        if (!header.ok) {
+          this.failStart(`missing secret in header ${key}: ${header.missing.join(', ')}`)
+          return
+        }
+        headers[key] = header.text
+      }
+      this.http = createMcpHttpSession(substituted.text, headers)
+      try {
+        await this.request('initialize', {
+          protocolVersion: PROTOCOL_VERSION,
+          capabilities: { tools: {} },
+          clientInfo: { name: 'jackbot', version: '0.1.0' },
+        })
+        await this.notify('notifications/initialized', {})
+        const listed = await this.request('tools/list', {}) as { tools?: ListedTool[] }
+        this.tools = Array.isArray(listed?.tools) ? listed.tools.filter((tool) => tool && typeof tool.name === 'string') : []
+        this.state = 'ready'
+        this.error = undefined
+      } catch (err) {
+        this.failStart(err instanceof Error ? err.message : String(err))
+      }
+      return
+    }
     const env: Record<string, string> = {}
     const missingEnv: string[] = []
     for (const [key, raw] of Object.entries(this.config.env)) {
@@ -409,7 +443,7 @@ class McpConnection {
 
   private failStart(message: string): void {
     this.state = 'error'
-    const cmd = [this.config.command, ...this.config.args].join(' ')
+    const cmd = this.config.url ?? [this.config.command, ...this.config.args].join(' ')
     const missing = /ENOENT|not found/i.test(message)
     const hint = missing
       ? ' The command was not found. Install it or fix the path, then Restart.'
@@ -443,6 +477,10 @@ class McpConnection {
   }
 
   private request(method: string, params: unknown): Promise<unknown> {
+    if (this.http) {
+      const id = this.nextId++
+      return this.http.request(method, params, id)
+    }
     const proc = this.proc
     if (!proc) return Promise.reject(new Error('mcp server not started'))
     const id = this.nextId++
@@ -461,6 +499,7 @@ class McpConnection {
   }
 
   private notify(method: string, params: unknown): Promise<void> {
+    if (this.http) return this.http.notify(method, params)
     return this.notifyRaw({ jsonrpc: '2.0', method, params })
   }
 

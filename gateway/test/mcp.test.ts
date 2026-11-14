@@ -1,3 +1,4 @@
+import { createServer } from 'node:http'
 import { mkdtempSync, readFileSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -11,6 +12,7 @@ import { createLLM, type AssistantTurn, type LLM } from '../src/llm.js'
 import { feedMcpStream } from '../src/mcp-frames.js'
 import { parseServer } from '../src/mcp-config.js'
 import { mcpToolAccess } from '../src/mcp-policy.js'
+import { resultFromHttpBody } from '../src/mcp-http.js'
 import { createMcpHost, type McpHost } from '../src/mcp.js'
 import { createSecretStore } from '../src/secrets.js'
 import { createApp } from '../src/server.js'
@@ -271,6 +273,63 @@ describe('mcp start failures', () => {
     expect(status.servers[0]?.error).toMatch(/not found/)
     expect(status.servers[0]?.error).toMatch(/Tried twice/)
     expect(Date.now() - started).toBeLessThan(8_000)
+  })
+})
+
+describe('mcp streamable http', () => {
+  it('reads a JSON result and an SSE result', () => {
+    expect(resultFromHttpBody(JSON.stringify({ jsonrpc: '2.0', id: 1, result: { ok: true } }), 'application/json', 1)).toEqual({ ok: true })
+    const sse = `event: message\ndata: ${JSON.stringify({ jsonrpc: '2.0', id: 2, result: { tools: [] } })}\n\n`
+    expect(resultFromHttpBody(sse, 'text/event-stream', 2)).toEqual({ tools: [] })
+  })
+
+  it('lists and calls a tool over streamable HTTP', async () => {
+    const server = createServer((req, res) => {
+      const chunks: Buffer[] = []
+      req.on('data', (chunk) => chunks.push(chunk as Buffer))
+      req.on('end', () => {
+        const msg = JSON.parse(Buffer.concat(chunks).toString('utf8')) as { id?: number; method?: string; params?: { arguments?: { text?: string } } }
+        if (msg.method === 'notifications/initialized') {
+          res.writeHead(202)
+          res.end()
+          return
+        }
+        const result = msg.method === 'initialize'
+          ? { protocolVersion: '2024-11-05', capabilities: { tools: {} }, serverInfo: { name: 'http', version: '0' } }
+          : msg.method === 'tools/list'
+            ? { tools: [{ name: 'echo', description: 'Echo.', inputSchema: { type: 'object', properties: { text: { type: 'string' } } } }] }
+            : { content: [{ type: 'text', text: `echo:${msg.params?.arguments?.text ?? ''}` }] }
+        const body = JSON.stringify({ jsonrpc: '2.0', id: msg.id, result })
+        if (msg.method === 'tools/list') {
+          res.writeHead(200, { 'content-type': 'text/event-stream', 'mcp-session-id': 'sess-1' })
+          res.end(`event: message\ndata: ${body}\n\n`)
+          return
+        }
+        res.writeHead(200, { 'content-type': 'application/json', 'mcp-session-id': 'sess-1' })
+        res.end(body)
+      })
+    })
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()))
+    const address = server.address()
+    const port = address && typeof address === 'object' ? address.port : 0
+    const dir = mkdtempSync(join(tmpdir(), 'jackbot-http-'))
+    const host = createMcpHost(dir)
+    hosts.push(host)
+    try {
+      expect(await host.upsert({
+        name: 'remote', url: `http://127.0.0.1:${port}/mcp`, command: '', args: [], env: {}, enabled: true, bots: [],
+      })).toEqual({ ok: true })
+      const defs = await host.toolDefs({ botId: 'researcher', watch: false })
+      expect(defs.map((tool) => tool.function.name)).toEqual(['mcp_remote_echo'])
+      const db = openDb(':memory:')
+      const echo = await host.call({ botId: 'researcher', name: 'mcp_remote_echo', args: { text: 'over http' }, watch: false, db })
+      expect(echo.text).toBe('echo:over http')
+      const status = await host.statuses()
+      expect(status.servers[0]).toMatchObject({ name: 'remote', state: 'ready', command: `http://127.0.0.1:${port}/mcp` })
+    } finally {
+      await host.stop()
+      await new Promise<void>((resolve) => server.close(() => resolve()))
+    }
   })
 })
 
