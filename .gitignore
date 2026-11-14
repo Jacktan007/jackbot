@@ -3,6 +3,13 @@ internal/
 .DS_Store
 *.log
 .env
+.env.*
+auth-token
+secrets.json
+*.db
+*.db-shm
+*.db-wal
+*.db-journal
 docs/openclaw-recipe/data/
 node_modules/
 dist/

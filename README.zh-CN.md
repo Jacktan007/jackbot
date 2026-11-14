@@ -1,5 +1,7 @@
 # jackbot
 
+致谢与来源：网关、线程界面和每位同事的电脑来自 wolfqing 的 [OpenSuperBot](https://github.com/wolfqing/OpenSuperBot)（MIT，原名 OpenGrokBot）。stdio MCP 客户端沿用 [nickylin/OpenGrokBot](https://github.com/nickylin/OpenGrokBot)（MIT）。其余 stdio 预设沿用 Mahmoud Amr 的 [Z4YT0N/OpenGrokBot](https://github.com/Z4YT0N/OpenGrokBot)（MIT）。
+
 自托管的同事，每位同事一台自己的电脑。用你自己的 API key。
 
 jackbot 是一个网关、一套线程界面，以及每位同事一台电脑：真正的 Chromium、一个文件夹、一个 shell。审批、记忆、例行任务和群里转交都走这条路。MCP 连接器是电脑旁边的额外工具，不换掉电脑。

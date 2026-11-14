@@ -1,5 +1,7 @@
 # jackbot
 
+Thanks and sources: the gateway, the thread UI, and the per-teammate computer come from [OpenSuperBot](https://github.com/wolfqing/OpenSuperBot) by wolfqing (MIT; formerly OpenGrokBot). The stdio MCP client follows [nickylin/OpenGrokBot](https://github.com/nickylin/OpenGrokBot) (MIT). The extra stdio presets follow [Z4YT0N/OpenGrokBot](https://github.com/Z4YT0N/OpenGrokBot) by Mahmoud Amr (MIT).
+
 Self-hosted teammates with their own computers. Bring your own API key.
 
 jackbot is a gateway, a thread UI, and one computer per teammate: a real Chromium, a folder, and a shell. Approvals, memory, routines, and group handoffs stay on that path. MCP connectors are extra tools beside the computer. They do not replace it.
