@@ -1,18 +1,18 @@
 # jackbot P0 Status (PRD v3 — Offline Scope)
 
-- **Date**: 2026-11-14
+- **Date**: 2026-11-14 (AC-1b / AC-1c updated 2026-11-15)
 - **Branch**: `cut-2026-11-14-parity-1`
 - **Base**: `main` @ `7a44615`
 - **Specs**: `/workspace/cuts/jackbot-PRD-v3.md` (sections 4 & 9), `/workspace/cuts/jackbot切分.md` (AC-1, AC-2)
-- **Scope**: Offline P0 tasks only (`AC-1` offline/CI setup + `AC-2`). Online/human steps (`AC-1b`, `AC-1c`) and remote GitHub Actions execution remain pending.
+- **Scope**: AC-1 (offline + CI), AC-2, AC-1b real-key main path (2026-11-15), AC-1c walkthrough findings recorded as known limitations (not fixed this round).
 
 ## Summary
 
 | AC | Status | Summary |
 | --- | --- | --- |
 | **AC-1** | **Partial** (Linux fresh-clone verified; 3-OS CI wired, pending CI run) | Fixed `TS2367` typecheck/build failure in `gateway/src/mcp.ts`, added `smoke:start` production build+start probe (`gateway/scripts/smoke-start.ts`), and wired it into the 3-OS CI matrix (`ubuntu-latest`, `macos-latest`, `windows-latest`) in `.github/workflows/ci.yml`. |
-| **AC-1b** | **Not Done** | Blocked on real model API keys and live E2E verification (offline stub checks only). |
-| **AC-1c** | **Not Done** | Blocked on human UI walkthrough from install to first conversation. |
+| **AC-1b** | **Done (main path)** | 2026-11-15: real relay key (OpenAI-compatible, model `gpt-6-astra`). Key entered both via env and via the UI settings API with no restart; chat replies, MCP fixture `echo`, and outward `send_note` held for approval. No code change needed. |
+| **AC-1c** | **Walkthrough done; findings not fixed** | 2026-11-14 stub-model walkthrough found 7 issues. Per PM scope (2026-11-15, Jack needs main path on 11-16), none fixed this round; all listed as known limitations in `docs/内部试用说明.md`. |
 | **AC-2** | **Done** | Audited gateway HTTP MCP implementation (`file:line` citations below), aligned `README.md`, `README.zh-CN.md`, and `docs/grok-bot-parity.md`, and added pinning tests in `gateway/test/mcp.test.ts`. |
 
 ---
@@ -66,27 +66,61 @@ All commands executed with `export COREPACK_HOME="$HOME/.cache/corepack" COREPAC
 
 ---
 
-## AC-1b: Real-Model End-to-End Verification
+## AC-1b: Real-Model End-to-End Verification (2026-11-15)
 
-### What Was Done
+### Setup
 
-- Verified offline `JACKBOT_MODEL=stub` startup (`smoke:start`) and offline stub test suite (`pnpm test`) without reading any credentials, API keys, or `.env` files.
+- Team relay station (OpenAI-compatible `/v1`, Chat Completions). `GET /v1/models` listed 13 models; `gpt-6-astra` answered, `gpt-6.1-terra` returned `503 Service temporarily unavailable` at test time.
+- Key read only from the box env var; never written to the repo, logs or chat. After the run, `grep -F` of the key over both gateway logs, `jackbot.db`/WAL and the repo returned 0 matches. The UI path stores it in `<data>/llm-key` (mode 600).
+- Fresh data dirs, `JACKBOT_COMPUTERS=local`, `pnpm dev`.
 
-### What Is NOT Done (AC-1b)
+### Run A: key via environment
 
-- Real-model E2E run using a live OpenAI-compatible API key (e.g., xAI or relay) exercising teammate creation, live model chat, built-in browser navigation, MCP tool invocation, approval resolution, and scheduled routine execution, with screen recording and logs attached.
+`JACKBOT_API_KEY` / `JACKBOT_API_BASE` / `JACKBOT_MODEL=gpt-6-astra`, `examples/mcp.fixture.json` copied to `<data>/mcp.json`.
+
+| Step | Result |
+| --- | --- |
+| Gateway boot | `listening on 127.0.0.1:4747 · model=gpt-6-astra`, sign-in URL printed |
+| Chat (Chief) "你好，用一句话介绍你自己。" | Real reply: 「我是 Chief，你的 AI 幕僚长，负责明确谁做什么、何时完成，只把需要你拍板的事交到你面前。」 |
+| MCP fixture `echo` | `mcp_fixture_echo` ok; report 「返回 echo:hello-ac1b」 |
+| Outward MCP `send_note` | Model first raised its own approval card; after approve, the gateway gate (`mcp-policy`) raised a second card with `sha256` of the exact args; tool ran only after that approval (`sent:ac1b-test`). |
+
+### Run B: key via the UI settings (non-coder path)
+
+Started with no key (`no model key yet` printed, gateway still boots). Then `POST /api/settings/test` + `PUT /api/settings` (what the 「AI 模型」 dialog calls) with provider `custom`, relay base URL, `gpt-6-astra`, key → test `ok, modelListed: true`, `needsRestart: []`. Next chat turn replied in Chinese immediately without restart.
+
+### Bugs found
+
+- None blocking the main path. UX: outward MCP tools can need two approvals with a real model (model's own card + gateway gate). Listed as a known limitation.
+
+### Spend
+
+About 6 short turns plus 2 direct probes on `gpt-6-astra`; estimated well under ¥1.
+
+### Not covered (out of this round's scope)
+
+Built-in browser navigation, group handoff, routines with the real model.
 
 ---
 
-## AC-1c: Human First-Run UI Walkthrough
+## AC-1c: First-Run UI Walkthrough
 
 ### What Was Done
 
-- Verified that `web/dist` builds cleanly and is served by the compiled gateway (`GET /` returns `web/dist/index.html` and `/auth?token=...` sets `jackbot_session`).
+- 2026-11-14 walkthrough of the web UI from sign-in (stub model, screenshots by Bill). Findings below.
+- 2026-11-15 scope decision (PM Karpa, relaying Jack): only the install → start → key → chat main path must work for 11-16; all findings go to known limitations, not fixed this round. They are listed in `docs/内部试用说明.md` §5.
 
-### What Is NOT Done (AC-1c)
+| # | Severity | Finding | Classification | Status |
+| --- | --- | --- | --- | --- |
+| 1 | HIGH | Stub run: "mcp send note" ran `mcp_fixture_send_note` with no approval card | Approval gating. Real-key run (AC-1b) showed the gateway gate holding; the stub discrepancy is not yet explained | Not fixed. Guide warns: do not configure outward MCP connectors yet |
+| 2 | HIGH | Routines panel empty with no create control; asking chat for a one-time routine raised an unrelated card to send 4 queued email drafts, no routine created | Routine discoverability + stray approval | Not fixed. Guide: reject that card, don't use routines yet |
+| 3 | MED | Stub reply to "hello" claimed work that didn't happen | Stub script wording (stub only) | Not fixed |
+| 4 | MED | Computer panel blank when screen WebSocket closed | Missing empty/error state | Not fixed |
+| 5 | LOW | Connectors panel says "No connectors yet" while fixture MCP tools run | Label | Not fixed |
+| 6 | LOW | favicon 404 | Asset | Not fixed |
+| 7 | NOTE | No way to delete a teammate | Missing feature | Not fixed |
 
-- Human UI walkthrough from initial setup through the first live conversation, documenting every friction point, fixing discovered UI issues, and attaching a screen recording.
+Reuse ladder (GEMINI.md §4) for the later fix of #1: reuse the existing `approvals` + `mcp-policy` path first; the open-source comparison (Claude Code / Cline per-tool permission gating) is deferred with the fix.
 
 ---
 

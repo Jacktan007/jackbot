@@ -14,7 +14,8 @@ This tree is **jackbot**. It vendors [OpenSuperBot](https://github.com/wolfqing/
 - MCP connectors: stdio and Streamable HTTP (`url` in `<data>/mcp.json` or `POST /api/mcp/servers`, JSON and SSE responses), a secret vault, Connectors in the sidebar, and stdio presets (Playwright, Chrome DevTools, GitHub, filesystem, memory, sequential thinking, Context7, Slack, Notion). Outward tools wait for an approval of those exact arguments. Watch routines do not receive MCP tools.
 - `JACKBOT_*` environment variables, with the older prefixes kept as aliases. New databases default to `jackbot.db`.
 - `pnpm --filter @jackbot/gateway run smoke:start` production build-and-start smoke check, wired into the Linux, macOS, and Windows CI matrix (`.github/workflows/ci.yml`).
-- P0 offline status tracker in `docs/P0_STATUS.md`.
+- P0 offline status tracker in `docs/P0_STATUS.md`, now with the AC-1b real-key run and AC-1c walkthrough findings.
+- `docs/内部试用说明.md`: internal trial guide in Chinese for non-coders (install, start, entering a relay key in the UI, known limitations), linked from `README.zh-CN.md`.
 
 ### Fixed
 
