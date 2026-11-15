@@ -106,6 +106,22 @@ describe('mcp secrets and config', () => {
     const parsed = parseServer({ name: 'fixture', command: 'node', args: ['echo.mjs'], env: { DEMO_TOKEN: '${secret:demo}' } })
     expect(parsed).toMatchObject({ server: { name: 'fixture', command: 'node', bots: [] } })
   })
+
+  it('validates streamable HTTP server urls and env header keys', () => {
+    expect(parseServer({
+      name: 'remote', url: 'https://example.com/mcp', command: '', env: { Authorization: 'Bearer ${secret:demo}' },
+    })).toMatchObject({
+      server: { name: 'remote', url: 'https://example.com/mcp', command: '', bots: [], env: { Authorization: 'Bearer ${secret:demo}' } },
+    })
+    expect(parseServer({ name: 'badproto', url: 'ftp://example.com/mcp', command: '' })).toEqual({
+      error: expect.stringMatching(/http or https/),
+    })
+    expect(parseServer({
+      name: 'badhdr', url: 'https://example.com/mcp', command: '', env: { 'X-Api-Key': '123' },
+    })).toEqual({
+      error: expect.stringMatching(/invalid env key/),
+    })
+  })
 })
 
 describe('mcp fixture', () => {
@@ -330,6 +346,149 @@ describe('mcp streamable http', () => {
       await host.stop()
       await new Promise<void>((resolve) => server.close(() => resolve()))
     }
+  })
+
+  it('sends substituted headers, tracks mcp-session-id, masks secrets, and holds outward tools', async () => {
+    const seen: Array<{ method: string; auth?: string; session?: string }> = []
+    const toolCalls: string[] = []
+    const server = createServer((req, res) => {
+      const chunks: Buffer[] = []
+      req.on('data', (chunk) => chunks.push(chunk as Buffer))
+      req.on('end', () => {
+        const msg = JSON.parse(Buffer.concat(chunks).toString('utf8')) as {
+          id?: number
+          method?: string
+          params?: { name?: string; arguments?: { text?: string } }
+        }
+        seen.push({
+          method: msg.method ?? '',
+          auth: typeof req.headers.authorization === 'string' ? req.headers.authorization : undefined,
+          session: typeof req.headers['mcp-session-id'] === 'string' ? req.headers['mcp-session-id'] : undefined,
+        })
+        if (msg.method === 'notifications/initialized') {
+          res.writeHead(202)
+          res.end()
+          return
+        }
+        let result: unknown
+        if (msg.method === 'initialize') {
+          result = { protocolVersion: '2024-11-05', capabilities: { tools: {} }, serverInfo: { name: 'http', version: '0' } }
+        } else if (msg.method === 'tools/list') {
+          result = {
+            tools: [
+              { name: 'echo', description: 'Echo.', inputSchema: { type: 'object', properties: {} } },
+              { name: 'send_note', description: 'Send.', inputSchema: { type: 'object', properties: { text: { type: 'string' } } } },
+            ],
+          }
+        } else {
+          const toolName = msg.params?.name ?? ''
+          toolCalls.push(toolName)
+          const text = toolName === 'echo'
+            ? `auth=${req.headers.authorization ?? ''}`
+            : `sent:${msg.params?.arguments?.text ?? ''}`
+          result = { content: [{ type: 'text', text }] }
+        }
+        res.writeHead(200, { 'content-type': 'application/json', 'mcp-session-id': 'sess-xyz' })
+        res.end(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result }))
+      })
+    })
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()))
+    const address = server.address()
+    const port = address && typeof address === 'object' ? address.port : 0
+    const dir = mkdtempSync(join(tmpdir(), 'jackbot-http-auth-'))
+    const host = createMcpHost(dir)
+    hosts.push(host)
+    try {
+      expect(host.secrets.set('demo', 'super-secret-http-token')).toEqual({ ok: true })
+      expect(await host.upsert({
+        name: 'remote',
+        url: `http://127.0.0.1:${port}/mcp`,
+        command: '',
+        args: [],
+        env: { Authorization: 'Bearer ${secret:demo}' },
+        enabled: true,
+        bots: [],
+      })).toEqual({ ok: true })
+
+      const defs = await host.toolDefs({ botId: 'researcher', watch: false })
+      expect(defs.map((tool) => tool.function.name).sort()).toEqual(['mcp_remote_echo', 'mcp_remote_send_note'])
+      expect(await host.toolDefs({ botId: 'researcher', watch: true })).toEqual([])
+
+      const db = openDb(':memory:')
+      const echo = await host.call({ botId: 'researcher', name: 'mcp_remote_echo', args: {}, watch: false, db })
+      expect(echo.text).toBe('auth=Bearer •••')
+      expect(echo.text).not.toContain('super-secret-http-token')
+
+      const approvals: number[] = []
+      const onApproval = async (input: { action: string; detail: string; kind: 'other'; target: string }) => {
+        const row = createApproval(db, {
+          threadId: 'dm:researcher', botId: 'researcher', action: input.action, detail: input.detail, kind: input.kind, target: input.target,
+        })
+        approvals.push(row.id)
+        return { approvalId: row.id }
+      }
+
+      const held = await host.call({
+        botId: 'researcher', name: 'mcp_remote_send_note', args: { text: 'hello' }, watch: false, db, onApproval,
+      })
+      expect(held.text.startsWith('Held for')).toBe(true)
+      expect(toolCalls).toEqual(['echo'])
+
+      resolveApproval(db, approvals[0]!, 'approve')
+      const sent = await host.call({
+        botId: 'researcher', name: 'mcp_remote_send_note', args: { text: 'hello' }, watch: false, db, onApproval,
+      })
+      expect(sent.text).toBe('sent:hello')
+      expect(toolCalls).toEqual(['echo', 'send_note'])
+
+      const again = await host.call({
+        botId: 'researcher', name: 'mcp_remote_send_note', args: { text: 'hello' }, watch: false, db, onApproval,
+      })
+      expect(again.text.startsWith('Held for')).toBe(true)
+      expect(toolCalls).toEqual(['echo', 'send_note'])
+
+      expect(seen).toEqual([
+        { method: 'initialize', auth: 'Bearer super-secret-http-token', session: undefined },
+        { method: 'notifications/initialized', auth: 'Bearer super-secret-http-token', session: 'sess-xyz' },
+        { method: 'tools/list', auth: 'Bearer super-secret-http-token', session: 'sess-xyz' },
+        { method: 'tools/call', auth: 'Bearer super-secret-http-token', session: 'sess-xyz' },
+        { method: 'tools/call', auth: 'Bearer super-secret-http-token', session: 'sess-xyz' },
+      ])
+    } finally {
+      await host.stop()
+      await new Promise<void>((resolve) => server.close(() => resolve()))
+    }
+  })
+
+  it('reports missing secrets in streamable HTTP url or header without throwing', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'jackbot-http-missing-'))
+    const host = createMcpHost(dir)
+    hosts.push(host)
+    expect(await host.upsert({
+      name: 'badurl',
+      url: 'https://example.com/${secret:missing}',
+      command: '',
+      args: [],
+      env: {},
+      enabled: true,
+      bots: [],
+    })).toEqual({ ok: true })
+    expect(await host.upsert({
+      name: 'badhdr',
+      url: 'http://127.0.0.1:1/mcp',
+      command: '',
+      args: [],
+      env: { Authorization: 'Bearer ${secret:missing}' },
+      enabled: true,
+      bots: [],
+    })).toEqual({ ok: true })
+
+    expect(await host.toolDefs({ botId: 'researcher', watch: false })).toEqual([])
+    const status = await host.statuses()
+    expect(status.servers).toEqual(expect.arrayContaining([
+      expect.objectContaining({ name: 'badurl', state: 'error', error: expect.stringMatching(/missing secret in url: missing/) }),
+      expect.objectContaining({ name: 'badhdr', state: 'error', error: expect.stringMatching(/missing secret in header Authorization: missing/) }),
+    ]))
   })
 })
 

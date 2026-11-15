@@ -7,12 +7,20 @@ names.
 
 ## [Unreleased]
 
-This tree is **jackbot**. It vendors [OpenSuperBot](https://github.com/wolfqing/OpenSuperBot) (MIT) and adds stdio MCP connectors beside each teammate's computer. `JACKBOT_*` is the env prefix. `OPENSUPERBOT_*` and `OPENGROKBOT_*` still work when the jackbot name is unset. The vendored computer image remains `opensuperbot/bot:dev`.
+This tree is **jackbot**. It vendors [OpenSuperBot](https://github.com/wolfqing/OpenSuperBot) (MIT) and adds stdio and Streamable HTTP MCP connectors beside each teammate's computer. `JACKBOT_*` is the env prefix. `OPENSUPERBOT_*` and `OPENGROKBOT_*` still work when the jackbot name is unset. The vendored computer image remains `opensuperbot/bot:dev`.
 
 ### Added
 
-- MCP connectors: stdio client, `<data>/mcp.json`, a secret vault, Connectors in the sidebar, and presets (Playwright, Chrome DevTools, GitHub, filesystem, memory, sequential thinking, Context7, Slack, Notion). Outward tools wait for an approval of those exact arguments. Watch routines do not receive MCP tools.
+- MCP connectors: stdio and Streamable HTTP (`url` in `<data>/mcp.json` or `POST /api/mcp/servers`, JSON and SSE responses), a secret vault, Connectors in the sidebar, and stdio presets (Playwright, Chrome DevTools, GitHub, filesystem, memory, sequential thinking, Context7, Slack, Notion). Outward tools wait for an approval of those exact arguments. Watch routines do not receive MCP tools.
 - `JACKBOT_*` environment variables, with the older prefixes kept as aliases. New databases default to `jackbot.db`.
+- `pnpm --filter @jackbot/gateway run smoke:start` production build-and-start smoke check, wired into the Linux, macOS, and Windows CI matrix (`.github/workflows/ci.yml`).
+- P0 offline status tracker in `docs/P0_STATUS.md`, now with the AC-1b real-key run and AC-1c walkthrough findings.
+- `docs/内部试用说明.md`: internal trial guide in Chinese for non-coders (install, start, entering a relay key in the UI, known limitations), linked from `README.zh-CN.md`.
+
+### Fixed
+
+- `McpConnection.startWithRetry` (`gateway/src/mcp.ts`) TypeScript state narrowing (`TS2367`) so `pnpm typecheck` and `pnpm build` succeed cleanly.
+- Aligned `README.md`, `README.zh-CN.md`, and `docs/grok-bot-parity.md` with the implemented Streamable HTTP MCP behavior and added pinning tests in `gateway/test/mcp.test.ts`.
 
 ### Security
 

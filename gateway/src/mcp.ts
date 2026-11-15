@@ -325,26 +325,33 @@ class McpConnection {
     private secrets: SecretStore,
   ) {}
 
+  private currentState(): McpServerStatus['state'] {
+    return this.state
+  }
+
+  private beginAttempt(): void {
+    this.state = 'starting'
+    this.error = undefined
+  }
+
   start(): Promise<void> {
     if (this.state === 'ready') return Promise.resolve()
     if (this.state === 'starting' && this.starting) return this.starting
-    this.state = 'starting'
-    this.error = undefined
+    this.beginAttempt()
     this.starting = this.startWithRetry()
     return this.starting
   }
 
   private async startWithRetry(): Promise<void> {
     await this.doStart()
-    if (this.state !== 'error') return
+    if (this.currentState() !== 'error') return
     const first = this.error ?? 'unknown error'
     if (!/timed out|exited|ENOENT|ECONNRESET|not found|EPIPE/i.test(first)) return
-    this.state = 'starting'
-    this.error = undefined
+    this.beginAttempt()
     await new Promise((resolve) => setTimeout(resolve, 300))
-    if (this.state === 'stopped') return
+    if (this.currentState() === 'stopped') return
     await this.doStart()
-    if (this.state === 'error' && this.error) {
+    if (this.currentState() === 'error' && this.error) {
       this.error = `${this.error} Tried twice. First attempt: ${first}`
     }
   }
