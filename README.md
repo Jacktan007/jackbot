@@ -4,9 +4,9 @@ Thanks and sources: the gateway, the thread UI, and the per-teammate computer co
 
 Self-hosted teammates with their own computers. Bring your own API key.
 
-jackbot is a gateway, a thread UI, and one computer per teammate: a real Chromium, a folder, and a shell. Approvals, memory, routines, and group handoffs stay on that path. MCP connectors are extra tools beside the computer. They do not replace it.
+jackbot is a self-hosted operating system for AI teammates: a gateway, a thread UI, and one computer per teammate — a real Chromium, a folder, and a shell. Approvals, memory, routines, and handoffs stay on that path. MCP connectors are extra tools beside the computer. They do not replace it.
 
-This is the closest open build in this repo to the xAI / Cursor Grok Bot shape. It is not Grok Bot, and it does not call a private Grok Bot API. The map of what matches and what does not is in [docs/grok-bot-parity.md](docs/grok-bot-parity.md). 中文说明：[README.zh-CN.md](README.zh-CN.md).
+It is already running inside a real company. The code base is MIT licensed. This project is not Grok Bot, and it does not call a private Grok Bot API. A capability map lives in [docs/grok-bot-parity.md](docs/grok-bot-parity.md). 中文说明：[README.zh-CN.md](README.zh-CN.md).
 
 ## Where the code comes from
 
