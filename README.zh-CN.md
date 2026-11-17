@@ -4,9 +4,9 @@
 
 自托管的同事，每位同事一台自己的电脑。用你自己的 API key。
 
-jackbot 是一个网关、一套线程界面，以及每位同事一台电脑：真正的 Chromium、一个文件夹、一个 shell。审批、记忆、例行任务和群里转交都走这条路。MCP 连接器是电脑旁边的额外工具，不换掉电脑。
+jackbot 是一套可自托管的 AI 同事操作系统：一个网关、一套线程界面，以及每位同事一台电脑——真正的 Chromium、一个文件夹、一个 shell。审批、记忆、例行任务和协作都走这条路。MCP 连接器是电脑旁边的额外工具，不换掉电脑。
 
-这是本仓库里最接近 xAI / Cursor Grok Bot 这种形态的开源实现。它不是 Grok Bot，也不调用任何私有的 Grok Bot 接口。对照和缺口见 [docs/grok-bot-parity.md](docs/grok-bot-parity.md)。English: [README.md](README.md).
+它已经在一家真实公司里运转。代码以 MIT 协议开源。它不是 Grok Bot，也不调用任何私有的 Grok Bot 接口。对照和缺口见 [docs/grok-bot-parity.md](docs/grok-bot-parity.md)。English: [README.md](README.md).
 
 ## 代码从哪来
 
